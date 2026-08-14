@@ -69,7 +69,10 @@ interface InternalDrone {
   lostLinkSinceS: number | null;
   untrustedSinceS: number | null;
   waitUntilS: number;
-  landingSiteId: string | null;
+  /** Pad the drone spawned from; the slot is freed at departure. */
+  spawnSiteId: string | null;
+  /** Landing slot reserved for this flight; freed at landing. */
+  reservedSiteId: string | null;
   controlMode: "mpc" | "vo";
   targetLabel: string;
   lastBreachCheckS: number;
@@ -77,6 +80,8 @@ interface InternalDrone {
   rerouteRetryAtS: number;
   legRetryAtS: number;
   retargetRetryAtS: number;
+  /** Lost-link emergency contract successfully installed. */
+  lostLinkTargeted: boolean;
 }
 
 export interface EngineOptions {
@@ -118,7 +123,9 @@ export class SimulationEngine {
 
   constructor(opts: EngineOptions = {}) {
     this.seed = opts.seed ?? defaultScenario.seed;
-    this.originalScenario = opts.scenario ?? makeScenarioCopy(defaultScenario);
+    // Deep-copy the supplied scenario so later external mutation cannot leak
+    // into reset behavior.
+    this.originalScenario = makeScenarioCopy(opts.scenario ?? defaultScenario);
     this.scenario = makeScenarioCopy(this.originalScenario);
     this.rng = new SeededRandom(this.seed);
     this.weatherRng = this.rng.branch(0x5eed);
@@ -148,6 +155,7 @@ export class SimulationEngine {
     this.contracts.clear();
     this.weather = [];
     this.weatherActive = false;
+    this.weatherIntensity = 0.8;
     this.weatherNextSpawnS = 10;
     this.counters = this.zeroCounters();
     this.recentEvents = [];
@@ -155,6 +163,12 @@ export class SimulationEngine {
     this.breachCooldown.clear();
     this.audit.clear();
     this.index.clear();
+    this.gateway.clear();
+    this.identity.clear();
+    // Recreate the random streams so a reset reproduces a fresh engine
+    // exactly (same seed -> same initial state and behavior).
+    this.rng = new SeededRandom(this.seed);
+    this.weatherRng = this.rng.branch(0x5eed);
     this.scenario = makeScenarioCopy(this.originalScenario); // pristine site usage
     this.droneSerial = 1;
     this.weatherSerial = 0;
@@ -278,7 +292,8 @@ export class SimulationEngine {
       lostLinkSinceS: null,
       untrustedSinceS: null,
       waitUntilS: initial ? this.simTimeS + this.rng.range(0, 25) : this.simTimeS + 1,
-      landingSiteId: site?.id ?? null,
+      spawnSiteId: site?.id ?? null,
+      reservedSiteId: null,
       controlMode: "mpc",
       targetLabel: site ? `spawn: ${site.name}` : "spawn",
       lastBreachCheckS: 0,
@@ -286,6 +301,7 @@ export class SimulationEngine {
       rerouteRetryAtS: 0,
       legRetryAtS: 0,
       retargetRetryAtS: 0,
+      lostLinkTargeted: false,
     };
     this.droneSerial++;
     this.drones.set(spec.id, d);
@@ -356,6 +372,11 @@ export class SimulationEngine {
     // Geofence violation check.
     this.checkGeofences(d);
 
+    // Lost-link emergency retarget retries on cooldown until reserved.
+    if (d.flags.lostLink && !d.lostLinkTargeted) {
+      this.attemptLostLinkRetarget(d);
+    }
+
     // State machine.
     switch (d.state) {
       case "requesting":
@@ -376,6 +397,7 @@ export class SimulationEngine {
             d.state = "en-route";
             d.launchUntilS = null;
             d.vel = { x: 0, y: 0, z: 0 };
+            this.releaseSpawnSlot(d);
           }
         }
         break;
@@ -521,28 +543,17 @@ export class SimulationEngine {
     });
     d.controlMode = control.mode;
 
-    if (d.flags.lostLink) {
-      // Emergency landing: direct steering, no contract following.
-      const site = this.nearestLandingSite(d.pos);
-      if (site) {
-        const dx = site.pos.x - d.pos.x;
-        const dy = site.pos.y - d.pos.y;
-        const dist = Math.hypot(dx, dy);
-        if (dist > 12) {
-          const speed = Math.min(10, d.spec.cruiseSpeed);
-          d.vel = { x: (dx / dist) * speed, y: (dy / dist) * speed, z: -2.5 };
-        }
-      }
-    } else {
-      d.vel.x += (control.vx - d.vel.x) * Math.min(1, dt * 3);
-      d.vel.y += (control.vy - d.vel.y) * Math.min(1, dt * 3);
-      d.vel.z += (control.vz - d.vel.z) * Math.min(1, dt * 2);
-      const speed = Math.hypot(d.vel.x, d.vel.y);
-      const maxS = d.mission?.maxSpeed ?? d.spec.maxSpeed;
-      if (speed > maxS) {
-        d.vel.x *= maxS / speed;
-        d.vel.y *= maxS / speed;
-      }
+    // The emergency landing contract is followed like any other contract
+    // (no straight-line bypass): the replacement reservation was validated
+    // against the 4D index before the mission changed.
+    d.vel.x += (control.vx - d.vel.x) * Math.min(1, dt * 3);
+    d.vel.y += (control.vy - d.vel.y) * Math.min(1, dt * 3);
+    d.vel.z += (control.vz - d.vel.z) * Math.min(1, dt * 2);
+    const speed = Math.hypot(d.vel.x, d.vel.y);
+    const maxS = d.mission?.maxSpeed ?? d.spec.maxSpeed;
+    if (speed > maxS) {
+      d.vel.x *= maxS / speed;
+      d.vel.y *= maxS / speed;
     }
 
     d.pos.x += d.vel.x * dt;
@@ -586,9 +597,10 @@ export class SimulationEngine {
     d.vel = { x: 0, y: 0, z: 0 };
     if (d.pos.z <= 0.2) {
       d.state = "landed";
-      if (d.landingSiteId) {
-        const site = this.scenario.landingSites.find((s) => s.id === d.landingSiteId);
+      if (d.reservedSiteId) {
+        const site = this.scenario.landingSites.find((s) => s.id === d.reservedSiteId);
         if (site) site.used = Math.max(0, site.used - 1);
+        d.reservedSiteId = null;
       }
       this.gateway.push("drone-landed", `${d.spec.callsign} landed`, { droneId: d.spec.id });
       this.auditAppend("landing", d.spec.id, {});
@@ -655,17 +667,29 @@ export class SimulationEngine {
       d.retargetRetryAtS = this.simTimeS + 5;
       return;
     }
-    if (d.landingSiteId && d.landingSiteId !== site.id) {
-      const old = this.scenario.landingSites.find((s) => s.id === d.landingSiteId);
+    if (d.reservedSiteId && d.reservedSiteId !== site.id) {
+      const old = this.scenario.landingSites.find((s) => s.id === d.reservedSiteId);
       if (old) old.used = Math.max(0, old.used - 1);
+      d.reservedSiteId = site.id;
+      site.used++;
+    } else if (!d.reservedSiteId) {
+      d.reservedSiteId = site.id;
+      site.used++;
     }
-    d.landingSiteId = site.id;
-    site.used++;
+    if (d.spawnSiteId) this.releaseSpawnSlot(d);
     d.state = "returning";
     if (!d.mission) return;
     d.mission.waypoints = [site.pos];
     d.mission.waypointIndex = 0;
     d.targetLabel = `emergency: ${site.name}`;
+  }
+
+  /** Free the pad the drone spawned from (at departure or on emergency). */
+  private releaseSpawnSlot(d: InternalDrone): void {
+    if (!d.spawnSiteId) return;
+    const site = this.scenario.landingSites.find((s) => s.id === d.spawnSiteId);
+    if (site) site.used = Math.max(0, site.used - 1);
+    d.spawnSiteId = null;
   }
 
   private releaseContract(d: InternalDrone): void {
@@ -718,8 +742,12 @@ export class SimulationEngine {
   private assignMission(d: InternalDrone): void {
     const rng = d.rng;
     if (d.spec.role === "delivery") {
-      const sites = this.scenario.landingSites.filter((s) => s.id !== d.landingSiteId);
-      const target = rng.pick(sites.length > 0 ? sites : this.scenario.landingSites);
+      // Reserve a destination pad with spare capacity (exclude the spawn pad).
+      const candidates = this.scenario.landingSites.filter((s) => s.id !== d.spawnSiteId && s.used < s.capacity);
+      const pool = candidates.length > 0 ? candidates : this.scenario.landingSites.filter((s) => s.id !== d.spawnSiteId);
+      const target = rng.pick(pool.length > 0 ? pool : this.scenario.landingSites);
+      target.used++;
+      d.reservedSiteId = target.id;
       d.mission = {
         waypoints: [{ ...target.pos, z: d.spec.zLanes[0] as number }],
         waypointIndex: 0,
@@ -988,22 +1016,56 @@ export class SimulationEngine {
       d.flags.lostLink = true;
       d.lostLinkSinceS = this.simTimeS;
       this.counters.lostLinkEvents++;
-      // Pre-programmed emergency landing: retarget the nearest pad.
-      const site = this.nearestLandingSite(d.pos);
-      if (site && d.mission) {
-        d.mission.waypoints = [{ ...site.pos }];
-        d.mission.waypointIndex = 0;
-        d.targetLabel = `lost-link landing: ${site.name}`;
-      }
       this.gateway.push("lost-link", `${d.spec.callsign}: link lost - emergency landing, clearing 100m exclusion zone`, {
         droneId,
       });
       this.auditAppend("lost-link", d.spec.id, {});
+      // Pre-programmed emergency landing: install a deconflicted contract to
+      // the nearest pad. On conflict the current reservation is kept and the
+      // retarget is retried on cooldown (stepDrone drives the retry).
+      this.attemptLostLinkRetarget(d);
     } else if (!on) {
       d.flags.lostLink = false;
       d.lostLinkSinceS = null;
+      d.lostLinkTargeted = false;
     }
     return { ok: true, message: on ? "Link lost (emergency landing)" : "Link restored" };
+  }
+
+  /** Plan + atomically reserve the lost-link emergency landing contract. */
+  private attemptLostLinkRetarget(d: InternalDrone): void {
+    if (d.lostLinkTargeted || !d.mission) return;
+    if (this.simTimeS < d.retargetRetryAtS) return;
+    const site = this.nearestLandingSite(d.pos);
+    if (!site) return;
+    const obstacles = this.currentObstacles();
+    const start = { ...d.pos, z: d.pos.z };
+    const raw = planAStar(start, site.pos, obstacles) ?? planRrt(start, site.pos, obstacles, d.rng.branch(777));
+    if (!raw || raw.length < 2) {
+      d.retargetRetryAtS = this.simTimeS + 5;
+      return;
+    }
+    const path = withVerticalProfile(raw, d.pos.z, 0);
+    if (!this.requestReplacement(d.spec.id, path, d.spec.cruiseSpeed * 0.8)) {
+      d.retargetRetryAtS = this.simTimeS + 5;
+      return;
+    }
+    // Reservation secured: now commit the mission change and slot transfer.
+    if (d.reservedSiteId && d.reservedSiteId !== site.id) {
+      const old = this.scenario.landingSites.find((s) => s.id === d.reservedSiteId);
+      if (old) old.used = Math.max(0, old.used - 1);
+      d.reservedSiteId = site.id;
+      site.used++;
+    } else if (!d.reservedSiteId) {
+      d.reservedSiteId = site.id;
+      site.used++;
+    }
+    if (d.spawnSiteId) this.releaseSpawnSlot(d);
+    d.mission.waypoints = [{ ...site.pos }];
+    d.mission.waypointIndex = 0;
+    d.targetLabel = `lost-link landing: ${site.name}`;
+    d.lostLinkTargeted = true;
+    this.gateway.push("landing", `${d.spec.callsign} emergency approach to ${site.name}`, { droneId: d.spec.id });
   }
 
   queryAirspace(q: AirspaceQuery): AirspaceQueryResult {

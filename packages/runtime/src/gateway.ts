@@ -56,4 +56,10 @@ export class PriorityGateway {
   get pendingCount(): number {
     return this.queues.reduce((acc, q) => acc + q.length, 0);
   }
+
+  /** Drop queued events and reset the sequence (used on engine reset). */
+  clear(): void {
+    this.queues = [[], [], [], []];
+    this.nextId = 1;
+  }
 }

@@ -63,6 +63,11 @@ export class IdentityRegistry {
   operatorName(operatorId: string): string {
     return this.operators.get(operatorId) ?? operatorId;
   }
+
+  /** Drop all registered identities (used on engine reset). */
+  clear(): void {
+    this.identities.clear();
+  }
 }
 
 /**

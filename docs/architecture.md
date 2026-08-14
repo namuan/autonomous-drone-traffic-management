@@ -27,10 +27,11 @@ z: 0–150). Pixels exist only in the renderer.
 - **4D trajectory contracts** (`contracts.ts`) — time-sampled (x, y, z, t)
   polylines with horizontal/vertical tolerances (25 m / 10 m demo tubes);
   `contractsConflict` performs strategic deconfliction at planning time
-  against the reservation index. Replacement contracts (reroutes,
-  retargeting, waypoint advances) are validated against the index too;
-  conflicted replacements fly provisionally without a reservation and emit
-  a `contract-rejected` event.
+  against the reservation index. Every route change (reroutes, retargeting,
+  waypoint advances, lost-link landings) is an atomic `requestReplacement`:
+  the candidate must clear the index before the current reservation is
+  released, so a drone always holds exactly one reservation and conflicted
+  replacements are rejected with the old reservation kept intact.
 - **Departure sequencing** — a drone only launches when the pad area is
   clear; launches climb vertically to their altitude lane (40/55/70 m for
   delivery, 85/100/115 m for surveillance) before en-route flight.

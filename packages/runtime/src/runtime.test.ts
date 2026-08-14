@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { buildContract } from "@utm/autonomy";
-import { makeScenario } from "@utm/core";
+import { CONFIG, makeScenario } from "@utm/core";
 import { SimulationEngine, biasForDrone } from "./engine.js";
 import { PriorityGateway } from "./gateway.js";
 import { AuditChain, IdentityRegistry } from "./identity.js";
@@ -264,13 +264,13 @@ describe("engine review regressions", () => {
     for (let i = 0; i < 300; i++) engine.tick();
     let sawTrail = false;
     for (const d of engine.snapshot().drones) {
-      expect(d.trail.length).toBeLessThanOrEqual(61);
+      expect(d.trail.length).toBeLessThanOrEqual(CONFIG.engine.maxTrailPoints);
       if (d.state === "en-route" && d.trail.length >= 2) sawTrail = true;
     }
     expect(sawTrail).toBe(true);
     for (let i = 0; i < 1500; i++) engine.tick();
     for (const d of engine.snapshot().drones) {
-      expect(d.trail.length).toBeLessThanOrEqual(61);
+      expect(d.trail.length).toBeLessThanOrEqual(CONFIG.engine.maxTrailPoints);
     }
   });
 
@@ -357,5 +357,133 @@ describe("engine review regressions", () => {
       expect(biasForDrone(id)).toBeGreaterThanOrEqual(-25);
       expect(biasForDrone(id)).toBeLessThanOrEqual(25);
     }
+  });
+});
+
+describe("engine review round 3 regressions", () => {
+  it("reset clears gateway queues and identity registrations", () => {
+    const engine = new SimulationEngine({ seed: 3 });
+    for (let i = 0; i < 200; i++) engine.tick();
+    const added = engine.addDrone("surveillance");
+    engine.setSpoof(added.droneId as string, true);
+    expect(engine.identity.isRegistered(added.droneId as string)).toBe(true);
+    expect(engine.gateway.pendingCount).toBeGreaterThan(0);
+
+    engine.reset();
+    engine.tick(); // flushes the reset notice
+    expect(engine.gateway.pendingCount).toBe(0);
+    expect(engine.identity.isRegistered(added.droneId as string)).toBe(false);
+  });
+
+  it("reset reproduces a fresh engine exactly", () => {
+    const a = new SimulationEngine({ seed: 9 });
+    for (let i = 0; i < 150; i++) a.tick();
+    a.reset();
+    const b = new SimulationEngine({ seed: 9 });
+    for (let i = 0; i < 150; i++) a.tick();
+    for (let i = 0; i < 150; i++) b.tick();
+    const sa = a.snapshot();
+    const sb = b.snapshot();
+    expect(sa.tick).toBe(sb.tick);
+    expect(sa.drones.length).toBe(sb.drones.length);
+    for (let i = 0; i < sa.drones.length; i++) {
+      expect(sa.drones[i]!.x).toBe(sb.drones[i]!.x);
+      expect(sa.drones[i]!.y).toBe(sb.drones[i]!.y);
+      expect(sa.drones[i]!.state).toBe(sb.drones[i]!.state);
+    }
+    // gatewayEvents differs by exactly the reset notice event.
+    const { gatewayEvents: _ga, ...ca } = sa.counters;
+    const { gatewayEvents: _gb, ...cb } = sb.counters;
+    expect(ca).toEqual(cb);
+    expect(sa.counters.gatewayEvents - sb.counters.gatewayEvents).toBe(1);
+  });
+
+  it("tracks landing-site occupancy correctly for a normal delivery", () => {
+    const sc = makeScenario(11);
+    sc.droneSpecs = [sc.droneSpecs[0]!]; // one delivery drone
+    sc.landingSites = sc.landingSites.map((l) => ({ ...l, capacity: 2, used: 0 }));
+    const engine = new SimulationEngine({ seed: 11, scenario: sc });
+    let landed = false;
+    for (let i = 0; i < 9000 && !landed; i++) {
+      engine.tick();
+      landed = engine.snapshot().drones.some((d) => d.state === "landed");
+    }
+    expect(landed).toBe(true);
+    // Spawn slot freed at departure, destination slot freed at landing.
+    for (const site of engine.snapshot().landingSites) {
+      expect(site.used).toBe(0);
+    }
+  });
+
+  it("does not double-count the reserved slot on same-site emergency retarget", () => {
+    const sc = makeScenario(12);
+    sc.droneSpecs = [sc.droneSpecs[0]!]; // one delivery drone
+    // A single pad: spawn, destination and emergency target are the same site.
+    sc.landingSites = [{ id: "LS-ONLY", name: "Only Pad", pos: { x: 1850, y: 860, z: 0 }, capacity: 4, used: 0 }];
+    const engine = new SimulationEngine({ seed: 12, scenario: sc });
+    // Trigger the emergency in the brief en-route window (the drone delivers
+    // to its own pad, so it lands almost immediately after launching).
+    let droneId: string | null = null;
+    for (let i = 0; i < 9000 && !droneId; i++) {
+      engine.tick();
+      const d = engine.snapshot().drones.find((x) => x.state === "en-route");
+      if (d) droneId = d.id;
+    }
+    expect(droneId).not.toBeNull();
+    const usedBefore = engine.snapshot().landingSites[0]!.used;
+    engine.setLostLink(droneId as string, true);
+    for (let i = 0; i < 100; i++) engine.tick();
+    const usedAfter = engine.snapshot().landingSites[0]!.used;
+    expect(usedAfter).toBe(usedBefore); // no leak on same-site retarget
+    // And the emergency completes.
+    let landed = false;
+    for (let i = 0; i < 3000 && !landed; i++) {
+      engine.tick();
+      landed = engine.snapshot().drones.some((d) => d.id === droneId && d.state === "landed");
+    }
+    expect(landed).toBe(true);
+    expect(engine.snapshot().landingSites[0]!.used).toBe(0);
+  });
+
+  it("lost-link retarget keeps the current reservation when conflicted", () => {
+    const sc = makeScenario(13);
+    sc.droneSpecs = [sc.droneSpecs[0]!];
+    sc.landingSites = [
+      { id: "LS-A", name: "Pad A", pos: { x: 1850, y: 860, z: 0 }, capacity: 4, used: 0 },
+      { id: "LS-B", name: "Pad B", pos: { x: 300, y: 60, z: 0 }, capacity: 4, used: 0 },
+    ];
+    const engine = new SimulationEngine({ seed: 13, scenario: sc });
+    for (let i = 0; i < 800; i++) engine.tick();
+    const snap = engine.snapshot();
+    const drone = snap.drones.find((d) => d.state === "en-route");
+    expect(drone).toBeDefined();
+    const before = engine.droneContractId(drone!.id) as string;
+    const targetBefore = drone!.targetLabel;
+
+    // Block the route to the nearest pad with a fake reservation.
+    const site = engine.snapshot().landingSites[0]!;
+    const blockPath = [
+      { x: drone!.x, y: drone!.y, z: drone!.z },
+      { x: site.pos.x, y: site.pos.y, z: 0 },
+    ];
+    const fake = buildContract("FAKE-2", blockPath, { speedMps: 10, t0: engine.timeS });
+    engine.index.addContract(fake);
+
+    engine.setLostLink(drone!.id, true);
+    // Immediately: the first retarget attempt is rejected; the existing
+    // reservation and mission are kept untouched.
+    expect(engine.droneContractId(drone!.id)).toBe(before);
+    const s2 = engine.snapshot();
+    expect(s2.drones.find((d) => d.id === drone!.id)?.targetLabel).toBe(targetBefore);
+    expect(s2.counters.contractsRejected).toBeGreaterThan(0);
+
+    // The cooldown retries keep trying and succeed once the drone's motion
+    // opens a deconflicted corridor; the emergency then completes.
+    let landed = false;
+    for (let i = 0; i < 6000 && !landed; i++) {
+      engine.tick();
+      landed = engine.snapshot().drones.some((d) => d.id === drone!.id && d.state === "landed");
+    }
+    expect(landed).toBe(true);
   });
 });
