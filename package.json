@@ -4,6 +4,10 @@
   "private": true,
   "type": "module",
   "description": "Autonomous Drone Traffic Management (UTM) system - simulation monorepo",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/namuan/autonomous-drone-traffic-management.git"
+  },
   "engines": {
     "node": ">=20"
   },
