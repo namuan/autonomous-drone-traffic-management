@@ -6,7 +6,8 @@ deterministic flight orchestrator with RRT\*/A\* planning, 4D trajectory
 contracts, a sensor-fusion mesh with trust scoring, MPC + velocity-obstacle
 tactical deconfliction, a priority event gateway, a 4D spatiotemporal index,
 Ed25519 drone identity, and a tamper-evident audit chain — all visualized in
-a live web console.
+a live web console with a top-down 2D operations view and an immersive 3D
+world view (WebGL2).
 
 > **This is a simulation for education and demonstration. It is not
 > airworthiness software.** See [docs/safety-scope.md](./docs/safety-scope.md)
@@ -87,6 +88,10 @@ Dependency direction: `core -> autonomy -> runtime -> apps`.
 - Live counters, priority-ordered gateway event feed, 4D airspace query tool,
   and per-drone inspection (fusion trust per sensor source, contract
   conformance, battery)
+- Two views via the topbar switcher: **2D OPS** (top-down console) and
+  **3D WORLD** (immersive WebGL2 scene — same snapshots, shared selection;
+  single click = select, double-click = follow cam, `F` follow, `Shift+F`
+  fullscreen, `Esc` exit/back; falls back gracefully without WebGL2)
 - Keyboard: `Space` pause · `W` weather · `D`/`V` add drone · `R` reset ·
   `Esc` deselect
 

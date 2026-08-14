@@ -150,6 +150,56 @@ try {
   const eventCount = await page.evaluate(() => document.querySelectorAll('[data-testid="event-list"] li').length);
   check("event feed populated", eventCount > 0, `${eventCount} events`);
 
+  // ----------------------------------------------------- 3D world view
+  await page.click('[data-testid="view-3d"]');
+  const webgl2 = await page.evaluate(() => !!document.createElement("canvas").getContext("webgl2"));
+
+  if (!webgl2) {
+    // Headless environments often lack GPU-backed WebGL2: verify the graceful
+    // fallback path instead (the app must never silently claim 3D is active).
+    await page.waitForSelector('[data-testid="world3d-fallback"]', { timeout: 15000 });
+    check("3D view shows WebGL fallback when WebGL2 is unavailable", true);
+    await page.click('[data-testid="world3d-fallback"] button');
+    await page.waitForSelector('[data-testid="sector-canvas"]', { timeout: 10000 });
+    check("fallback 'Switch to 2D' returns to console", true);
+    await page.screenshot({ path: join(ROOT, "artifacts/world3d-fallback.png"), fullPage: false });
+  } else {
+    await page.waitForSelector('[data-testid="world3d"] canvas', { timeout: 15000 });
+    check("3D world view mounts WebGL canvas", true);
+
+    // Make sure a drone is selected deterministically before switching views.
+    if (!selected) {
+      await page.evaluate(() => {
+        const canvas = document.querySelector("canvas");
+        const r = canvas.getBoundingClientRect();
+        for (const fx of [0.3, 0.5, 0.7]) {
+          for (const fy of [0.3, 0.5, 0.7]) {
+            canvas.dispatchEvent(new MouseEvent("click", { clientX: r.left + r.width * fx, clientY: r.top + r.height * fy, bubbles: true }));
+          }
+        }
+      });
+      await page.waitForSelector('[data-testid="drone-details"]', { timeout: 5000 }).catch(() => null);
+    }
+    const panel3d = await page.locator('[data-testid="drone-details"]').count();
+    check("selection persists into 3D view", panel3d === 1);
+
+    // Fullscreen overlay engages and exits.
+    await page.click('.world3d-toolbar button:has-text("FULLSCREEN")');
+    await page.waitForSelector(".world3d.fullscreen", { timeout: 5000 });
+    check("3D fullscreen overlay engages", true);
+    await page.click('.world3d-hud button:has-text("exit")');
+    await page.waitForSelector(".world3d:not(.fullscreen)", { timeout: 5000 });
+    check("3D fullscreen exits", true);
+
+    // Screenshot the 3D world for the record.
+    await page.screenshot({ path: join(ROOT, "artifacts/world3d.png"), fullPage: false });
+
+    // Back to the 2D console.
+    await page.click('[data-testid="view-2d"]');
+    await page.waitForSelector('[data-testid="sector-canvas"]', { timeout: 10000 });
+    check("switch back to 2D view", true);
+  }
+
   check("no console errors", consoleErrors.length === 0, consoleErrors.slice(0, 2).join(" | "));
 
   // Screenshot for the record.

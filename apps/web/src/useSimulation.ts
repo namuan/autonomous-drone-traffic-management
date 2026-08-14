@@ -1,10 +1,13 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { ClientCommand, Snapshot, SystemEvent } from "@utm/core";
+import type { SimFrame } from "./world3d/math.js";
 
 export interface SimulationState {
   snapshot: Snapshot | null;
   prevSnapshot: Snapshot | null;
   lastSnapTime: number;
+  /** Atomic snapshot pairing for interpolation (previous + current + receipt time). */
+  frame: SimFrame | null;
   connected: boolean;
   events: SystemEvent[];
   selectedId: string | null;
@@ -15,9 +18,7 @@ export interface SimulationState {
 const wsUrl = () => `${location.protocol === "https:" ? "wss://" : "ws://"}${location.host}/ws`;
 
 export function useSimulation(): SimulationState {
-  const [snapshot, setSnapshot] = useState<Snapshot | null>(null);
-  const [prevSnapshot, setPrevSnapshot] = useState<Snapshot | null>(null);
-  const [lastSnapTime, setLastSnapTime] = useState(0);
+  const [frame, setFrame] = useState<SimFrame | null>(null);
   const [connected, setConnected] = useState(false);
   const [events, setEvents] = useState<SystemEvent[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
@@ -43,9 +44,11 @@ export function useSimulation(): SimulationState {
         try {
           const msg = JSON.parse(String(ev.data)) as { kind: string; snapshot?: Snapshot; event?: SystemEvent };
           if (msg.kind === "snapshot" && msg.snapshot) {
-            setPrevSnapshot((prev) => prev ?? (msg.snapshot as Snapshot));
-            setSnapshot(msg.snapshot);
-            setLastSnapTime(performance.now());
+            setFrame((prev) => ({
+              current: msg.snapshot as Snapshot,
+              previous: prev?.current ?? null,
+              receivedAtMs: performance.now(),
+            }));
           } else if (msg.kind === "event" && msg.event) {
             setEvents((prev) => [...prev.slice(-80), msg.event as SystemEvent]);
           }
@@ -71,7 +74,17 @@ export function useSimulation(): SimulationState {
     };
   }, []);
 
-  return { snapshot, prevSnapshot, lastSnapTime, connected, events, selectedId, select, error };
+  return {
+    snapshot: frame?.current ?? null,
+    prevSnapshot: frame?.previous ?? null,
+    lastSnapTime: frame?.receivedAtMs ?? 0,
+    frame,
+    connected,
+    events,
+    selectedId,
+    select,
+    error,
+  };
 }
 
 /** POST a command to the REST API. */

@@ -1,58 +1,35 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { Suspense, lazy, useEffect, useMemo, useState } from "react";
 import type { AirspaceQueryResult, DroneView } from "@utm/core";
-import { computeViewport, drawSector, pickDrone } from "./canvas.js";
+import Ops2D from "./components/Ops2D.js";
 import { fmtSimTime, postCommand, useSimulation } from "./useSimulation.js";
 import "./styles.css";
 
+// Three.js stays out of the initial bundle; the 3D world view loads on demand.
+const World3DView = lazy(() => import("./world3d/World3DView.js"));
+
 const PRIORITY_CLASS: Record<number, string> = { 0: "p0", 1: "p1", 2: "p2", 3: "p3" };
+
+type ViewMode = "2d" | "3d";
 
 export default function App() {
   const sim = useSimulation();
-  const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const [view, setView] = useState<ViewMode>(() => (localStorage.getItem("utm.view") === "3d" ? "3d" : "2d"));
+  const [fullscreen, setFullscreen] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
   const [queryResult, setQueryResult] = useState<AirspaceQueryResult | null>(null);
   const [queryBusy, setQueryBusy] = useState(false);
 
-  // ------------------------------------------------------------ render loop
+  // Persist the chosen view across reloads.
   useEffect(() => {
-    const canvas = canvasRef.current;
-    if (!canvas) return;
-    const ctx = canvas.getContext("2d");
-    if (!ctx) return;
-    const reduced = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
-    let raf = 0;
-    let lastSnap = sim.snapshot;
-    const render = () => {
-      const snap = sim.snapshot;
-      const dpr = Math.min(2, window.devicePixelRatio || 1);
-      const w = canvas.clientWidth;
-      const h = canvas.clientHeight;
-      if (canvas.width !== Math.round(w * dpr) || canvas.height !== Math.round(h * dpr)) {
-        canvas.width = Math.round(w * dpr);
-        canvas.height = Math.round(h * dpr);
-      }
-      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-      if (snap) {
-        const vp = computeViewport(w, h, snap);
-        let alpha = 1;
-        if (!reduced && lastSnap && lastSnap !== snap && sim.lastSnapTime > 0) {
-          const dt = performance.now() - sim.lastSnapTime;
-          alpha = Math.max(0, Math.min(1, 1 - dt / 100));
-        }
-        drawSector(ctx, snap, vp, sim.selectedId, alpha);
-        lastSnap = snap;
-      }
-      raf = requestAnimationFrame(render);
-    };
-    raf = requestAnimationFrame(render);
-    return () => cancelAnimationFrame(raf);
-  }, [sim.snapshot, sim.selectedId, sim.lastSnapTime]);
+    localStorage.setItem("utm.view", view);
+  }, [view]);
 
   // --------------------------------------------------------------- keyboard
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       const tag = (e.target as HTMLElement)?.tagName;
       if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return;
+      if (view === "3d" && e.key === "Escape") return; // the 3D view owns Escape
       switch (e.key) {
         case " ":
           e.preventDefault();
@@ -81,7 +58,7 @@ export default function App() {
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [sim]);
+  }, [sim, view]);
 
   const snap = sim.snapshot;
   const selected: DroneView | undefined = snap?.drones.find((d) => d.id === sim.selectedId);
@@ -151,34 +128,41 @@ export default function App() {
             </div>
           ))}
         </div>
+        <div className="view-switch" role="group" aria-label="view mode">
+          <button data-testid="view-2d" className={view === "2d" ? "active" : ""} onClick={() => setView("2d")}>
+            2D OPS
+          </button>
+          <button data-testid="view-3d" className={view === "3d" ? "active" : ""} onClick={() => setView("3d")}>
+            3D WORLD
+          </button>
+        </div>
         <div className={`conn ${sim.connected ? "ok" : "down"}`} data-testid="conn">
           {sim.connected ? "STREAM OK" : "RECONNECTING"}
         </div>
       </header>
 
       <main className="layout">
-        <section className="map-wrap" aria-label="sector map">
-          <canvas
-            ref={canvasRef}
-            data-testid="sector-canvas"
-            role="img"
-            aria-label="Top-down map of sector A1: geofences, landing sites, weather, drones with trails and mesh links"
-            onClick={(e) => {
-              const canvas = canvasRef.current;
-              if (!canvas || !snap) return;
-              const rect = canvas.getBoundingClientRect();
-              const vp = computeViewport(rect.width, rect.height, snap);
-              const id = pickDrone(snap, vp, e.clientX - rect.left, e.clientY - rect.top);
-              sim.select(id);
-            }}
-          />
-          <div className="legend">
-            <span><i className="dot delivery" /> delivery</span>
-            <span><i className="dot surveillance" /> surveillance</span>
-            <span><i className="dot weather" /> turbulence</span>
-            <span><i className="dot nofly" /> no-fly zone</span>
-            <span><i className="dot mesh" /> mesh link</span>
-          </div>
+        <section className="map-wrap" aria-label="sector view">
+          {view === "2d" ? (
+            <Ops2D frame={sim.frame} selectedId={sim.selectedId} onSelect={sim.select} />
+          ) : (
+            <Suspense fallback={<div className="view-loading">Loading 3D world…</div>}>
+              <World3DView
+                frame={sim.frame}
+                selectedId={sim.selectedId}
+                onSelect={sim.select}
+                paused={snap?.paused ?? false}
+                simTimeS={snap?.simTimeS ?? 0}
+                connected={sim.connected}
+                onPause={() =>
+                  void act({ type: "pause", paused: !snap?.paused }, snap?.paused ? "Resumed" : "Paused")
+                }
+                fullscreen={fullscreen}
+                onFullscreenChange={setFullscreen}
+                onSwitch2D={() => setView("2d")}
+              />
+            </Suspense>
+          )}
           {notice && <div className="notice" role="status">{notice}</div>}
         </section>
 

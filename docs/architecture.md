@@ -103,6 +103,34 @@ engine tick (100 ms)
 web console: render snapshot + accept commands (REST) -> next tick
 ```
 
+## Web console views
+
+The console is a pure snapshot renderer in both views; neither view holds
+simulation state.
+
+- **2D OPS** (`components/Ops2D.tsx` + `canvas.ts`) — the top-down sector
+  map with geofences, pads, weather, drones, trails, mesh links. This is the
+  default view.
+- **3D WORLD** (`world3d/World3D.ts`, wrapper `world3d/World3DView.tsx`) —
+  an immersive Three.js scene of the same sector: grid + boundary walls,
+  geofence volumes, landing sites, weather cells, and low-poly quadcopters
+  with detection/state rings, fading trails and dashed planned routes. It is
+  lazy-loaded (separate chunk) so the 2D bundle is unchanged. Pure coordinate
+  and interpolation math lives in `world3d/math.ts` and is unit-tested.
+
+Shared mechanics:
+
+- `useSimulation` stores each WebSocket snapshot atomically as
+  `{ current, previous, receivedAtMs }`; the 3D view eases drone positions
+  from `previous` to `current` over one tick (100 ms) at rAF rate, and snaps
+  when paused, reduced-motion, or no previous observation.
+- Selection is shared state: clicking a drone in either view updates the
+  same Selected aircraft panel. In 3D, single click = select, double-click
+  = select + follow cam (F toggles, Escape releases), drag/wheel = orbit.
+- Shift+F toggles the immersive fullscreen overlay (floating HUD with
+  clock, pause, exit). WebGL2 is required; without it the view shows a
+  fallback with a Switch to 2D button and never claims to be active.
+
 ## Production adapter map
 
 | Pillar | Simulation adapter | Production replacement |
