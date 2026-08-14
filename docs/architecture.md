@@ -59,10 +59,12 @@ accuracy-weighted blend of source estimates.
   safety-breach counter records airborne pairs closer than 18 m
   horizontally and 15 m vertically.
 
-Known limitation: the greedy controller guarantees clearance but can settle
-into a safe parallel/convoy pattern instead of a clean crossing in
-pathological head-on cases. In the full engine this is mitigated by altitude
-lanes, departure sequencing and rerouting; it is not a safety guarantee.
+Known limitation: in a deterministic head-on stress scenario the controller
+maintained clearance and engaged the VO fallback, but the greedy formulation
+can settle into a safe parallel/convoy pattern instead of a clean crossing in
+pathological cases. In the full engine this is mitigated by altitude lanes,
+departure sequencing and rerouting. Passing the specified scenario is not a
+safety guarantee.
 
 ### 4. Telemetry Gateway (`gateway.ts`)
 

@@ -271,7 +271,7 @@ describe("velocity obstacles", () => {
 });
 
 describe("controlled head-on encounter (MPC/VO closed loop)", () => {
-  it("maintains >= 18 m clearance and still completes the pass", () => {
+  it("maintains clearance, engages VO and makes progress", () => {
     // Two agents, same altitude, closing head-on at 24 m/s relative.
     const a = { pos: { x: 100, y: 500, z: 50 }, vel: { x: 12, y: 0, z: 0 } };
     const b = { pos: { x: 900, y: 500, z: 50 }, vel: { x: -12, y: 0, z: 0 } };
@@ -307,13 +307,15 @@ describe("controlled head-on encounter (MPC/VO closed loop)", () => {
       maxTravel = Math.max(maxTravel, Math.hypot(a.pos.x - 100, a.pos.y - 500), Math.hypot(b.pos.x - 900, b.pos.y - 500));
     }
 
-    // Clearance must hold (small tolerance for the discrete controller).
-    expect(minSep).toBeGreaterThanOrEqual(17);
+    // Clearance must hold: the measured minimum in this deterministic
+    // scenario is ~24 m (slightly above the 18 m requirement).
+    expect(minSep).toBeGreaterThanOrEqual(18);
     // The VO fallback engaged during the encounter.
     expect(modeSawVO).toBe(true);
     // No deadlock at the start: the pair made real progress.
+    expect(maxTravel).toBeGreaterThan(100);
     // (Note: the greedy controller may settle into a safe parallel/convoy
-    // pattern instead of a clean crossing - that is a documented limitation
-    // of the simplified MPC/VO demo, not a safety failure.)
+    // pattern instead of a clean crossing - a documented limitation of the
+    // simplified MPC/VO demo, not a safety failure.)
   });
 });

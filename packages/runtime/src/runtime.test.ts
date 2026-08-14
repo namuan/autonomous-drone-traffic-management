@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { buildContract } from "@utm/autonomy";
-import { SimulationEngine } from "./engine.js";
+import { makeScenario } from "@utm/core";
+import { SimulationEngine, biasForDrone } from "./engine.js";
 import { PriorityGateway } from "./gateway.js";
 import { AuditChain, IdentityRegistry } from "./identity.js";
 import { SpacetimeIndex } from "./index4d.js";
@@ -254,5 +255,107 @@ describe("SimulationEngine", () => {
     const engine = new SimulationEngine({ seed: 1 });
     expect(engine.setSpoof("NOPE", true).ok).toBe(false);
     expect(engine.setLostLink("NOPE", true).ok).toBe(false);
+  });
+});
+
+describe("engine review regressions", () => {
+  it("records and caps flight trails", { timeout: 20000 }, () => {
+    const engine = new SimulationEngine({ seed: 33 });
+    for (let i = 0; i < 300; i++) engine.tick();
+    let sawTrail = false;
+    for (const d of engine.snapshot().drones) {
+      expect(d.trail.length).toBeLessThanOrEqual(61);
+      if (d.state === "en-route" && d.trail.length >= 2) sawTrail = true;
+    }
+    expect(sawTrail).toBe(true);
+    for (let i = 0; i < 1500; i++) engine.tick();
+    for (const d of engine.snapshot().drones) {
+      expect(d.trail.length).toBeLessThanOrEqual(61);
+    }
+  });
+
+  it("emits one geofence-violation event per entry and audits it", () => {
+    const sc = makeScenario(42);
+    // Put every spawn pad inside the heliport no-fly zone: all drones spawn
+    // inside it and cannot leave (planning rejects the blocked start), so the
+    // entry event must fire exactly once per drone - not once per tick.
+    sc.landingSites = [{ id: "LS-TRAP", name: "Trap Pad", pos: { x: 100, y: 830, z: 0 }, capacity: 20, used: 0 }];
+    const engine = new SimulationEngine({ seed: 42, scenario: sc });
+    for (let i = 0; i < 120; i++) engine.tick();
+    const events = engine.snapshot().recentEvents.filter((e) => e.type === "geofence-violation");
+    const audits = engine.audit.entries.filter((e) => e.type === "geofence-violation");
+    expect(events.length).toBe(7); // one per drone, deduplicated
+    expect(audits.length).toBe(7);
+    expect(engine.audit.verify().ok).toBe(true);
+  });
+
+  it("rejects conflicted replacement contracts and keeps the current reservation", () => {
+    const engine = new SimulationEngine({ seed: 7 });
+    for (let i = 0; i < 600; i++) engine.tick();
+    const drone = engine.snapshot().drones.find((d) => d.state === "en-route" && d.contractId);
+    expect(drone).toBeDefined();
+    const before = engine.droneContractId(drone!.id);
+    expect(before).not.toBeNull();
+
+    // Reserve a fake conflicting contract along the drone's own corridor.
+    const current = engine.index.getContract(before!);
+    const along = (current!.points).map((p) => ({ x: p.x, y: p.y, z: p.z }));
+    const fake = buildContract("FAKE-1", along, { speedMps: 10, t0: engine.timeS + 4 });
+    engine.index.addContract(fake);
+
+    // A replacement along the same corridor must be rejected...
+    const ok = engine.requestReplacement(drone!.id, along, 10);
+    expect(ok).toBe(false);
+    // ...and the existing reservation must be untouched.
+    expect(engine.droneContractId(drone!.id)).toBe(before);
+    expect(engine.index.getContract(before!)).toBeDefined();
+    expect(engine.snapshot().counters.contractsRejected).toBeGreaterThan(0);
+
+    // A clear path elsewhere succeeds atomically.
+    const clearPath = [
+      { x: drone!.x + 800, y: Math.max(30, drone!.y + 800), z: drone!.z },
+      { x: drone!.x + 1000, y: Math.max(30, drone!.y + 800), z: drone!.z },
+    ];
+    const oldObj = engine.index.getContract(before!);
+    const ok2 = engine.requestReplacement(drone!.id, clearPath, 10);
+    expect(ok2).toBe(true);
+    // The reservation object is atomically replaced (same stable id).
+    expect(engine.index.getContract(before!)).not.toBe(oldObj);
+    const replaced = engine.index.getContract(before!);
+    expect(Math.abs(replaced!.points[0]!.x - clearPath[0]!.x)).toBeLessThan(5);
+  });
+
+  it("reset clears reservations and restores pristine landing-site usage", () => {
+    const engine = new SimulationEngine({ seed: 5 });
+    for (let i = 0; i < 400; i++) engine.tick();
+    engine.setWeather(true);
+    for (let i = 0; i < 100; i++) engine.tick();
+    engine.addDrone("delivery");
+    for (let i = 0; i < 100; i++) engine.tick();
+    expect(engine.index.contractCount).toBeGreaterThan(0);
+
+    engine.reset();
+    expect(engine.index.contractCount).toBe(0);
+    expect(engine.snapshot().weather.length).toBe(0);
+
+    // Landing-site occupancy must match a fresh engine.
+    const fresh = new SimulationEngine({ seed: 5 });
+    const sites = engine.snapshot().landingSites;
+    const freshSites = fresh.snapshot().landingSites;
+    for (let i = 0; i < sites.length; i++) {
+      expect(sites[i]!.used).toBe(freshSites[i]!.used);
+    }
+    // And the simulation runs normally after reset.
+    for (let i = 0; i < 400; i++) engine.tick();
+    expect(engine.snapshot().counters.contractsIssued).toBeGreaterThan(0);
+  });
+
+  it("assigns distinct avoidance biases to standard drone ids", () => {
+    const biases = new Set(["DEL-001", "SUR-001", "DEL-002", "SUR-002"].map((id) => biasForDrone(id)));
+    expect(biases.size).toBe(4);
+    for (const id of ["DEL-001", "SUR-001", "DEL-002", "SUR-002"]) {
+      expect(biasForDrone(id)).toBeGreaterThanOrEqual(-25);
+      expect(biasForDrone(id)).toBeLessThanOrEqual(25);
+    }
   });
 });

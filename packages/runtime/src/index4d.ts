@@ -61,6 +61,12 @@ export class SpacetimeIndex {
     this.telemetry = [];
   }
 
+  /** Drop every reservation and telemetry sample (used on engine reset). */
+  clear(): void {
+    this.contracts.clear();
+    this.telemetry = [];
+  }
+
   /** All drones that pass through the cube in [t0, t1], from contracts or recorded positions. */
   queryCube(q: AirspaceQuery): AirspaceQueryResult {
     const t0 = Math.min(q.t0, q.t1);

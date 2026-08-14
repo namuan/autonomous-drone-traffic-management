@@ -74,6 +74,9 @@ interface InternalDrone {
   targetLabel: string;
   lastBreachCheckS: number;
   removeAtS: number | null;
+  rerouteRetryAtS: number;
+  legRetryAtS: number;
+  retargetRetryAtS: number;
 }
 
 export interface EngineOptions {
@@ -85,6 +88,7 @@ export interface EngineOptions {
 
 export class SimulationEngine {
   readonly seed: number;
+  private originalScenario: Scenario;
   private scenario: Scenario;
   private rng: SeededRandom;
   private weatherRng: SeededRandom;
@@ -114,7 +118,8 @@ export class SimulationEngine {
 
   constructor(opts: EngineOptions = {}) {
     this.seed = opts.seed ?? defaultScenario.seed;
-    this.scenario = opts.scenario ?? makeScenarioCopy(defaultScenario);
+    this.originalScenario = opts.scenario ?? makeScenarioCopy(defaultScenario);
+    this.scenario = makeScenarioCopy(this.originalScenario);
     this.rng = new SeededRandom(this.seed);
     this.weatherRng = this.rng.branch(0x5eed);
     this.paused = opts.startPaused ?? false;
@@ -149,7 +154,8 @@ export class SimulationEngine {
     this.meshLinks = [];
     this.breachCooldown.clear();
     this.audit.clear();
-    this.index.clearTelemetry();
+    this.index.clear();
+    this.scenario = makeScenarioCopy(this.originalScenario); // pristine site usage
     this.droneSerial = 1;
     this.weatherSerial = 0;
     this.simTimeS = 0;
@@ -277,6 +283,9 @@ export class SimulationEngine {
       targetLabel: site ? `spawn: ${site.name}` : "spawn",
       lastBreachCheckS: 0,
       removeAtS: null,
+      rerouteRetryAtS: 0,
+      legRetryAtS: 0,
+      retargetRetryAtS: 0,
     };
     this.droneSerial++;
     this.drones.set(spec.id, d);
@@ -461,8 +470,8 @@ export class SimulationEngine {
     const contract = d.contractId ? this.contracts.get(d.contractId) : undefined;
     const goal = d.mission?.waypoints[d.mission.waypointIndex] ?? null;
 
-    // Weather blocking ahead -> tactical reroute (A*).
-    if (this.weatherBlockingAhead(d) && d.state !== "rerouting") {
+    // Weather blocking ahead -> tactical reroute (A*) with retry cooldown.
+    if (this.weatherBlockingAhead(d) && d.state !== "rerouting" && this.simTimeS >= d.rerouteRetryAtS) {
       this.startReroute(d);
       return;
     }
@@ -508,7 +517,7 @@ export class SimulationEngine {
       route,
       neighbors,
       weather: this.weather,
-      biasDeg: ((d.spec.id.charCodeAt(3) ?? 1) * 7) % 51 - 25,
+      biasDeg: biasForDrone(d.spec.id),
     });
     d.controlMode = control.mode;
 
@@ -543,26 +552,28 @@ export class SimulationEngine {
     // Arrival check.
     if (goal && dist2(d.pos.x, d.pos.y, goal.x, goal.y) < 20 && Math.abs(d.pos.z - goal.z) < 12) {
       const mission = d.mission;
-      if (mission && mission.waypointIndex < mission.waypoints.length - 1) {
-        mission.waypointIndex++;
-        d.targetLabel = this.targetName(d);
-        // The old contract still ends at the previous waypoint: issue a fresh
-        // contract to the next waypoint so control follows the new leg.
-        this.releaseContract(d);
-        const nextGoal = mission.waypoints[mission.waypointIndex] as Point3;
+      if (mission && mission.waypointIndex < mission.waypoints.length - 1 && this.simTimeS >= d.legRetryAtS) {
+        const nextGoal = mission.waypoints[mission.waypointIndex + 1] as Point3;
         const obstacles = this.currentObstacles();
         const start = { ...d.pos, z: d.pos.z };
         const path = planAStar(start, nextGoal, obstacles) ?? planRrt(start, nextGoal, obstacles, d.rng.branch(this.tickCounter % 89));
-        if (path && path.length >= 2) {
-          const contract = buildContract(d.spec.id, path, { speedMps: mission.cruiseSpeed, t0: this.simTimeS });
-          this.reserveContract(contract, d.spec.id);
-          d.contractId = contract.id;
-          d.route = path;
+        if (!path || path.length < 2) {
+          d.legRetryAtS = this.simTimeS + 5;
+          return;
         }
+        // Atomic replacement: only advance the leg when the new contract
+        // clears the index; otherwise loiter at the waypoint and retry.
+        const replaced = this.requestReplacement(d.spec.id, path, mission.cruiseSpeed);
+        if (!replaced) {
+          d.legRetryAtS = this.simTimeS + 5;
+          return;
+        }
+        mission.waypointIndex++;
+        d.targetLabel = this.targetName(d);
         this.gateway.push("drone-requested", `${d.spec.callsign} reached waypoint, continuing to ${d.targetLabel}`, {
           droneId: d.spec.id,
         });
-      } else {
+      } else if (mission && mission.waypointIndex === mission.waypoints.length - 1) {
         d.state = "landing";
         this.gateway.push("landing", `${d.spec.callsign} arriving at ${d.targetLabel}`, { droneId: d.spec.id });
         this.releaseContract(d);
@@ -603,14 +614,16 @@ export class SimulationEngine {
       d.conformanceSinceS = this.simTimeS + CONFIG.conformance.rerouteAfterS + 2;
       return;
     }
-    this.releaseContract(d);
-    const contract = buildContract(d.spec.id, path, {
-      speedMps: d.mission?.cruiseSpeed ?? d.spec.cruiseSpeed,
-      t0: this.simTimeS,
-    });
-    this.reserveContract(contract, d.spec.id);
-    d.contractId = contract.id;
-    d.route = path;
+    // Atomic replacement: the candidate must clear the 4D index before the
+    // current reservation is released; on conflict we keep flying the
+    // existing contract and retry later.
+    const replaced = this.requestReplacement(d.spec.id, path, d.mission?.cruiseSpeed ?? d.spec.cruiseSpeed);
+    if (!replaced) {
+      d.state = "en-route";
+      d.rerouteRetryAtS = this.simTimeS + 5;
+      d.conformanceSinceS = this.simTimeS + 5;
+      return;
+    }
     this.counters.reroutes++;
     d.conformanceState = "conforming";
     d.conformanceSinceS = null;
@@ -623,8 +636,25 @@ export class SimulationEngine {
   }
 
   private retargetToLanding(d: InternalDrone): void {
+    if (this.simTimeS < d.retargetRetryAtS) return;
     const site = this.nearestLandingSite(d.pos);
     if (!site) return;
+    const obstacles = this.currentObstacles();
+    const start = { ...d.pos, z: d.pos.z };
+    const raw = planAStar(start, site.pos, obstacles) ?? planRrt(start, site.pos, obstacles, d.rng.branch(555));
+    if (!raw || raw.length < 2) {
+      d.retargetRetryAtS = this.simTimeS + 5;
+      return;
+    }
+    // Add a descent profile down to the pad.
+    const path = withVerticalProfile(raw, d.pos.z, 0);
+    // Reserve before mutating mission state; on conflict keep the current
+    // contract and retry shortly (the emergency still holds a reservation).
+    const replaced = this.requestReplacement(d.spec.id, path, d.spec.cruiseSpeed * 0.8);
+    if (!replaced) {
+      d.retargetRetryAtS = this.simTimeS + 5;
+      return;
+    }
     if (d.landingSiteId && d.landingSiteId !== site.id) {
       const old = this.scenario.landingSites.find((s) => s.id === d.landingSiteId);
       if (old) old.used = Math.max(0, old.used - 1);
@@ -636,18 +666,6 @@ export class SimulationEngine {
     d.mission.waypoints = [site.pos];
     d.mission.waypointIndex = 0;
     d.targetLabel = `emergency: ${site.name}`;
-    this.releaseContract(d);
-    const obstacles = this.currentObstacles();
-    const start = { ...d.pos, z: d.pos.z };
-    const raw = planAStar(start, site.pos, obstacles) ?? planRrt(start, site.pos, obstacles, d.rng.branch(555));
-    if (raw && raw.length >= 2) {
-      // Add a descent profile down to the pad.
-      const path = withVerticalProfile(raw, d.pos.z, 0);
-      const contract = buildContract(d.spec.id, path, { speedMps: d.spec.cruiseSpeed * 0.8, t0: this.simTimeS });
-      this.reserveContract(contract, d.spec.id);
-      d.contractId = contract.id;
-      d.route = path;
-    }
   }
 
   private releaseContract(d: InternalDrone): void {
@@ -658,27 +676,43 @@ export class SimulationEngine {
     }
   }
 
+  /** The drone's active contract id (null when none). Public for observability. */
+  droneContractId(droneId: string): string | null {
+    return this.drones.get(droneId)?.contractId ?? null;
+  }
+
   /**
-   * Reserve a (replacement) contract in the 4D index only when it is
-   * deconflicted. The control state keeps the contract either way, so the
-   * drone can still fly its planned route; the reservation is what the index
-   * guarantees. Returns true when a reservation was made.
+   * Atomically replace a drone's trajectory contract with a new path:
+   * the candidate is validated against the 4D index BEFORE the current
+   * reservation is released. On conflict the current reservation is kept
+   * intact, contractsRejected is incremented and a contract-rejected event
+   * is emitted; the drone never flies without a reservation it holds.
    */
-  private reserveContract(contract: ReturnType<typeof buildContract>, droneId: string): boolean {
-    this.contracts.set(contract.id, contract);
+  requestReplacement(droneId: string, path: Point3[], speedMps: number): boolean {
+    const d = this.drones.get(droneId);
+    if (!d) return false;
+    const contract = buildContract(droneId, path, { speedMps, t0: this.simTimeS });
     const conflicting = this.index.conflicts(contract, droneId);
-    if (conflicting.length === 0) {
-      this.index.addContract(contract);
-      return true;
+    if (conflicting.length > 0) {
+      this.counters.contractsRejected++;
+      this.gateway.push(
+        "contract-rejected",
+        `replacement contract conflicts with ${conflicting[0]?.droneId} - keeping current reservation`, {
+          droneId,
+          data: { with: conflicting[0]?.droneId },
+        }
+      );
+      return false;
     }
-    this.gateway.push(
-      "contract-rejected",
-      `replacement contract ${contract.id} conflicts with ${conflicting[0]?.droneId} - flying provisional, no reservation`, {
-        droneId,
-        data: { with: conflicting[0]?.droneId },
-      }
-    );
-    return false;
+    if (d.contractId) {
+      this.index.releaseContract(d.contractId);
+      this.contracts.delete(d.contractId);
+    }
+    this.index.addContract(contract);
+    this.contracts.set(contract.id, contract);
+    d.contractId = contract.id;
+    d.route = path;
+    return true;
   }
 
   private assignMission(d: InternalDrone): void {
@@ -1042,4 +1076,12 @@ function makeScenarioCopy(s: Scenario): Scenario {
     landingSites: s.landingSites.map((l) => ({ ...l, pos: { ...l.pos } })),
     droneSpecs: s.droneSpecs.map((d) => ({ ...d, zLanes: [...d.zLanes] })),
   };
+}
+
+/** Deterministic per-drone avoidance bias in degrees (-25..25), hashed from
+ * the full drone id so standard ids (DEL-001, SUR-001, ...) diverge. */
+export function biasForDrone(id: string): number {
+  let h = 5381;
+  for (let i = 0; i < id.length; i++) h = ((h * 33) ^ id.charCodeAt(i)) >>> 0;
+  return (h % 51) - 25;
 }
