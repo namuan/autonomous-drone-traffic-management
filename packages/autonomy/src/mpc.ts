@@ -31,6 +31,8 @@ export interface ControlInput {
   target?: Point3;
   neighbors: NeighborPrediction[];
   weather: WeatherZone[];
+  /** Per-drone asymmetry for the VO fallback (breaks mirror dances). */
+  biasDeg?: number;
 }
 
 export interface ControlResult {
@@ -60,16 +62,20 @@ export function computeControl(input: ControlInput): ControlResult {
   const samples = Math.round(cfg.horizonS / cfg.sampleStepS);
   const step = cfg.sampleStepS;
 
-  // Downsample the route for fast distance queries.
+  // Downsample the route for fast distance queries (always keep a segment).
   const routePts: Point3[] = [];
   for (let i = 0; i < route.length; i += ROUTE_SAMPLE_EVERY) routePts.push(route[i] as Point3);
   if (routePts.length === 0) routePts.push(pos);
+  if (routePts.length === 1 && route.length > 1) routePts.push(route[route.length - 1] as Point3);
 
   const curHeading = Math.atan2(vel.y, vel.x);
   const w = cfg.weights;
 
   const distanceToRoute = (x: number, y: number, z: number): number => {
-    let best = Infinity;
+    let best =
+      routePts.length > 0
+        ? Math.hypot(x - (routePts[0] as Point3).x, y - (routePts[0] as Point3).y, z - (routePts[0] as Point3).z)
+        : Infinity;
     for (let i = 1; i < routePts.length; i++) {
       const a = routePts[i - 1] as Point3;
       const b = routePts[i] as Point3;
@@ -114,12 +120,12 @@ export function computeControl(input: ControlInput): ControlResult {
           sz += vz * step;
           const t = s * step;
 
-          pathDev += Math.min(60, distanceToRoute(sx, sy, sz)) / 60;
+          pathDev += distanceToRoute(sx, sy, sz) / 60;
           if (input.target) {
             // Sqrt scaling keeps the term discriminative close to the goal.
-            targetDev += Math.min(1, Math.sqrt(Math.hypot(sx - input.target.x, sy - input.target.y, sz - input.target.z)) / 10);
+            targetDev += Math.sqrt(Math.hypot(sx - input.target.x, sy - input.target.y, sz - input.target.z)) / 10;
           }
-          altPenalty += Math.min(60, Math.abs(sz - input.laneZ)) / 60;
+          altPenalty += Math.abs(sz - input.laneZ) / 60;
 
           for (const wz of weather) {
             const d = dist2(sx, sy, wz.center.x, wz.center.y);
@@ -173,6 +179,7 @@ export function computeControl(input: ControlInput): ControlResult {
       preferredVel: preferred,
       neighbors,
       maxSpeed: input.maxSpeed,
+      biasDeg: input.biasDeg,
     });
     return {
       vx: vo.vx,

@@ -11,6 +11,7 @@ export type EventType =
   | "drone-landed"
   | "reroute"
   | "conformance-alert"
+  | "geofence-violation"
   | "safety-breach"
   | "weather-event"
   | "untrusted-flagged"
@@ -34,6 +35,7 @@ export interface SystemEvent {
 export const EVENT_PRIORITY: Record<EventType, EventPriority> = {
   "emergency-landing": 0,
   "lost-link": 0,
+  "geofence-violation": 1,
   "safety-breach": 1,
   "untrusted-flagged": 1,
   "contract-issued": 1,

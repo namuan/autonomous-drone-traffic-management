@@ -25,8 +25,12 @@ z: 0–150). Pixels exist only in the renderer.
 - **A\*** (`astar.ts`) — tactical replanning on a 10 m grid for weather
   blocking, persistent non-conformance, and retargeting.
 - **4D trajectory contracts** (`contracts.ts`) — time-sampled (x, y, z, t)
-  polylines with horizontal/vertical tolerances; `contractsConflict` performs
-  strategic deconfliction at planning time against the reservation index.
+  polylines with horizontal/vertical tolerances (25 m / 10 m demo tubes);
+  `contractsConflict` performs strategic deconfliction at planning time
+  against the reservation index. Replacement contracts (reroutes,
+  retargeting, waypoint advances) are validated against the index too;
+  conflicted replacements fly provisionally without a reservation and emit
+  a `contract-rejected` event.
 - **Departure sequencing** — a drone only launches when the pad area is
   clear; launches climb vertically to their altitude lane (40/55/70 m for
   delivery, 85/100/115 m for surveillance) before en-route flight.
@@ -45,13 +49,20 @@ accuracy-weighted blend of source estimates.
 
 - Layer 1 (strategic): contract-vs-index deconfliction before dispatch.
 - Layer 2 (tactical): a receding-horizon controller scores discrete
-  velocity/altitude candidates over a 3 s horizon against route deviation,
+  velocity/altitude candidates over a 4 s horizon against route deviation,
   lookahead-target distance, energy, weather and predicted neighbor
   positions, then applies the best first action.
 - Layer 3 (emergency): velocity obstacles pick the velocity closest to
   preferred that is outside every collision cone; vertical separation of
-  15 m counts as deconflicted. A safety-breach counter records airborne
-  pairs closer than 18 m horizontally and 15 m vertically.
+  15 m counts as deconflicted. A per-drone rotation bias and a fast
+  climb/descend escape (6 m/s) break mirror-symmetric deadlocks. A
+  safety-breach counter records airborne pairs closer than 18 m
+  horizontally and 15 m vertically.
+
+Known limitation: the greedy controller guarantees clearance but can settle
+into a safe parallel/convoy pattern instead of a clean crossing in
+pathological head-on cases. In the full engine this is mitigated by altitude
+lanes, departure sequencing and rerouting; it is not a safety guarantee.
 
 ### 4. Telemetry Gateway (`gateway.ts`)
 
@@ -83,7 +94,7 @@ engine tick (100 ms)
   -> fusion observes true state through sensor models
   -> orchestrator: contracts, conformance, weather, battery
   -> MPC/VO control, physics integration
-  -> mesh links, separation checks, telemetry recording
+  -> mesh links, separation checks, trail + telemetry recording
   -> gateway flush (priority ordered) -> audit chain for critical events
   -> snapshot broadcast over WebSocket
 web console: render snapshot + accept commands (REST) -> next tick

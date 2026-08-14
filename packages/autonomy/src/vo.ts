@@ -17,6 +17,8 @@ export interface VOInput {
   preferredVel: Point3;
   neighbors: NeighborPrediction[];
   maxSpeed: number;
+  /** Per-drone asymmetry (degrees) to break symmetric deadlock dances. */
+  biasDeg?: number;
 }
 
 export interface VOResult {
@@ -32,7 +34,9 @@ const FACTORS = [1.0, 0.85, 1.2];
 
 export function computeVOVelocity(input: VOInput): VOResult {
   const horizon = CONFIG.vo.horizonS;
-  const { pos, preferredVel, neighbors, maxSpeed } = input;
+  const margin = CONFIG.vo.marginM;
+  const { pos, preferredVel, neighbors, maxSpeed, biasDeg = 0 } = input;
+  const bias = (biasDeg * Math.PI) / 180;
 
   const prefHeading = Math.atan2(preferredVel.y, preferredVel.x);
   const prefSpeed = Math.min(maxSpeed, Math.hypot(preferredVel.x, preferredVel.y) || 1);
@@ -40,16 +44,17 @@ export function computeVOVelocity(input: VOInput): VOResult {
   const candidates: { vx: number; vy: number; vz: number }[] = [];
   for (const rot of ROTATIONS_DEG) {
     for (const factor of FACTORS) {
-      const heading = prefHeading + (rot * Math.PI) / 180;
+      const heading = prefHeading + bias + (rot * Math.PI) / 180;
       const speed = Math.min(maxSpeed, prefSpeed * factor);
       candidates.push({ vx: Math.cos(heading) * speed, vy: Math.sin(heading) * speed, vz: 0 });
     }
   }
-  // Vertical escape options: keep the preferred course and climb/descend.
-  candidates.push({ vx: preferredVel.x, vy: preferredVel.y, vz: 3 });
-  candidates.push({ vx: preferredVel.x, vy: preferredVel.y, vz: -3 });
-  candidates.push({ vx: preferredVel.x * 0.8, vy: preferredVel.y * 0.8, vz: 3 });
-  candidates.push({ vx: preferredVel.x * 0.8, vy: preferredVel.y * 0.8, vz: -3 });
+  // Vertical escape options: keep the preferred course and climb/descend
+  // fast enough to reach 15 m vertical separation inside the horizon.
+  candidates.push({ vx: preferredVel.x, vy: preferredVel.y, vz: 6 });
+  candidates.push({ vx: preferredVel.x, vy: preferredVel.y, vz: -6 });
+  candidates.push({ vx: preferredVel.x * 0.8, vy: preferredVel.y * 0.8, vz: 6 });
+  candidates.push({ vx: preferredVel.x * 0.8, vy: preferredVel.y * 0.8, vz: -6 });
 
   const forbidden = (vx: number, vy: number, vz: number): { forbidden: boolean; minSep: number } => {
     let minSep = Infinity;
@@ -64,19 +69,24 @@ export function computeVOVelocity(input: VOInput): VOResult {
       let tca = rvLen2 < 1e-6 ? 0 : -(p.x * rv.x + p.y * rv.y) / rvLen2;
       tca = Math.max(0, Math.min(horizon, tca));
       const d = Math.hypot(p.x + rv.x * tca, p.y + rv.y * tca);
-      if (d < minSep) minSep = d;
-      // Vertical separation of 15 m counts as deconflicted (PLAN.md).
+      // Vertical separation of 15 m counts as deconflicted (PLAN.md): such
+      // neighbors do not constrain the velocity and do not limit clearance.
       const vd = Math.abs(pos.z + vz * tca - (n.pos.z + n.vel.z * tca));
-      if (d < radius && vd < CONFIG.separation.minVertSepM) return { forbidden: true, minSep: d };
+      if (vd < CONFIG.separation.minVertSepM) {
+        if (d < minSep) minSep = d;
+        if (d < radius) return { forbidden: true, minSep: d };
+      }
     }
     return { forbidden: false, minSep };
   };
 
-  const deviationScore = (vx: number, vy: number, vz: number): number => {
+  const deviationScore = (vx: number, vy: number, vz: number, minSep: number): number => {
     const heading = Math.atan2(vy, vx);
     const dHeading = Math.abs(((heading - prefHeading + Math.PI * 3) % (Math.PI * 2)) - Math.PI);
     const speed = Math.hypot(vx, vy);
-    return dHeading + (Math.abs(speed - prefSpeed) / prefSpeed) * 0.5 + Math.abs(vz) * 0.05;
+    // Prefer comfortable clearance over razor-thin minimums (1.5x margin).
+    const clearance = Math.max(0, margin * 1.5 - minSep) * 0.6;
+    return dHeading + (Math.abs(speed - prefSpeed) / prefSpeed) * 0.5 + Math.abs(vz) * 0.05 + clearance;
   };
 
   let bestSafe: { vx: number; vy: number; vz: number; score: number; minSep: number } | null = null;
@@ -86,7 +96,7 @@ export function computeVOVelocity(input: VOInput): VOResult {
     const speed = Math.hypot(c.vx, c.vy);
     if (speed > maxSpeed + 0.01) continue;
     const { forbidden: bad, minSep } = forbidden(c.vx, c.vy, c.vz);
-    const score = deviationScore(c.vx, c.vy, c.vz);
+    const score = deviationScore(c.vx, c.vy, c.vz, minSep);
     if (!bad) {
       if (!bestSafe || score < bestSafe.score) bestSafe = { ...c, score, minSep };
     } else if (!bestUnsafe || minSep > bestUnsafe.minSep) {

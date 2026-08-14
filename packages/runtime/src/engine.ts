@@ -51,6 +51,8 @@ interface InternalDrone {
   spec: DroneSpec;
   state: DroneState;
   flags: { untrusted: boolean; lostLink: boolean; criticalBattery: boolean };
+  /** Geofence id the drone is currently inside, or null. */
+  insideGeofence: string | null;
   pos: Point3;
   vel: Point3;
   batteryWh: number;
@@ -253,6 +255,7 @@ export class SimulationEngine {
       spec,
       state: "requesting",
       flags: { untrusted: false, lostLink: false, criticalBattery: false },
+      insideGeofence: null,
       pos: sitePos,
       vel: { x: 0, y: 0, z: 0 },
       batteryWh: spec.batteryCapacityWh,
@@ -316,11 +319,16 @@ export class SimulationEngine {
       }
     }
 
+    // Record the flight trail for the console renderer.
+    if (this.tickCounter % CONFIG.engine.trailSampleEveryTicks === 0) {
+      d.trail.push({ ...d.pos });
+      if (d.trail.length > CONFIG.engine.maxTrailPoints) d.trail.shift();
+    }
+
     if (d.state === "landed" || d.state === "removed") return;
 
     // Fusion: observe the true state through the sensor mesh.
     const fused = d.fusion.step(this.simTimeS, d.pos, d.rng);
-
     // Trust / spoofing detection: ADS-B vs radar divergence.
     if (d.spoofOn && fused.adsBvsRadarM > CONFIG.trust.spoofUntrustedM) {
       d.untrustedSinceS = d.untrustedSinceS === null ? this.simTimeS : d.untrustedSinceS;
@@ -500,6 +508,7 @@ export class SimulationEngine {
       route,
       neighbors,
       weather: this.weather,
+      biasDeg: ((d.spec.id.charCodeAt(3) ?? 1) * 7) % 51 - 25,
     });
     d.controlMode = control.mode;
 
@@ -546,8 +555,7 @@ export class SimulationEngine {
         const path = planAStar(start, nextGoal, obstacles) ?? planRrt(start, nextGoal, obstacles, d.rng.branch(this.tickCounter % 89));
         if (path && path.length >= 2) {
           const contract = buildContract(d.spec.id, path, { speedMps: mission.cruiseSpeed, t0: this.simTimeS });
-          this.index.addContract(contract);
-          this.contracts.set(contract.id, contract);
+          this.reserveContract(contract, d.spec.id);
           d.contractId = contract.id;
           d.route = path;
         }
@@ -600,8 +608,7 @@ export class SimulationEngine {
       speedMps: d.mission?.cruiseSpeed ?? d.spec.cruiseSpeed,
       t0: this.simTimeS,
     });
-    this.index.addContract(contract);
-    this.contracts.set(contract.id, contract);
+    this.reserveContract(contract, d.spec.id);
     d.contractId = contract.id;
     d.route = path;
     this.counters.reroutes++;
@@ -637,8 +644,7 @@ export class SimulationEngine {
       // Add a descent profile down to the pad.
       const path = withVerticalProfile(raw, d.pos.z, 0);
       const contract = buildContract(d.spec.id, path, { speedMps: d.spec.cruiseSpeed * 0.8, t0: this.simTimeS });
-      this.index.addContract(contract);
-      this.contracts.set(contract.id, contract);
+      this.reserveContract(contract, d.spec.id);
       d.contractId = contract.id;
       d.route = path;
     }
@@ -650,6 +656,29 @@ export class SimulationEngine {
       this.contracts.delete(d.contractId);
       d.contractId = null;
     }
+  }
+
+  /**
+   * Reserve a (replacement) contract in the 4D index only when it is
+   * deconflicted. The control state keeps the contract either way, so the
+   * drone can still fly its planned route; the reservation is what the index
+   * guarantees. Returns true when a reservation was made.
+   */
+  private reserveContract(contract: ReturnType<typeof buildContract>, droneId: string): boolean {
+    this.contracts.set(contract.id, contract);
+    const conflicting = this.index.conflicts(contract, droneId);
+    if (conflicting.length === 0) {
+      this.index.addContract(contract);
+      return true;
+    }
+    this.gateway.push(
+      "contract-rejected",
+      `replacement contract ${contract.id} conflicts with ${conflicting[0]?.droneId} - flying provisional, no reservation`, {
+        droneId,
+        data: { with: conflicting[0]?.droneId },
+      }
+    );
+    return false;
   }
 
   private assignMission(d: InternalDrone): void {
@@ -816,13 +845,25 @@ export class SimulationEngine {
   }
 
   private checkGeofences(d: InternalDrone): void {
+    let inside: string | null = null;
     for (const gf of this.scenario.geofences) {
       if (d.pos.z < gf.zMin || d.pos.z > gf.zMax) continue;
       if (pointInRect(d.pos, gf.rect, -3)) {
-        this.gateway.push("conformance-alert", `${d.spec.callsign} inside geofence ${gf.name}`, { droneId: d.spec.id });
-        this.auditAppend("conformance-alert", d.spec.id, { geofence: gf.id });
+        inside = gf.id;
         break;
       }
+    }
+    if (inside && d.insideGeofence !== inside) {
+      // Entry: one distinct, audited geofence-violation event.
+      d.insideGeofence = inside;
+      const gf = this.scenario.geofences.find((g) => g.id === inside);
+      this.gateway.push("geofence-violation", `${d.spec.callsign} entered geofence ${gf?.name ?? inside}`, {
+        droneId: d.spec.id,
+        data: { geofence: inside },
+      });
+      this.auditAppend("geofence-violation", d.spec.id, { geofence: inside });
+    } else if (!inside) {
+      d.insideGeofence = null;
     }
   }
 

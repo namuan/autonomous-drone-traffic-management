@@ -34,8 +34,13 @@ traffic management system. It is not software for operating aircraft.
 ## Interpretation rules
 
 - Thresholds (18 m separation, 15 m vertical, 15/20 m spoof, 30/15 m
-  conformance) are simulation parameters drawn from PLAN.md. They are not
-  regulatory limits.
+  conformance, 25 m/10 m contract tolerances) are simulation parameters
+  drawn from PLAN.md. They are not regulatory limits.
+- The greedy MPC/VO controller maintains clearance in tests but can settle
+  into a safe parallel/convoy pattern instead of a clean crossing in
+  pathological head-on cases; the altitude lanes, departure sequencing and
+  rerouting in the orchestrator mitigate this in practice. None of this is
+  a safety assurance result.
 - Latency, throughput, collision-probability and capacity figures in PLAN.md
   are design targets for production systems. Do not report measurements of
   this simulation as if they were those targets.

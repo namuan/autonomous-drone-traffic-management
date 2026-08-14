@@ -65,17 +65,17 @@ export const CONFIG = {
   },
 
   mpc: {
-    horizonS: 3, // predict 3 s forward (PLAN.md section 2.3)
+    horizonS: 4, // predict forward (PLAN.md: 3 s; 4 s gives earlier dodge onset)
     sampleStepS: 0.5,
     headingOffsetsDeg: [-160, -120, -80, -40, -20, 0, 20, 40, 80, 120, 160],
     speedFactors: [0.55, 0.8, 1.0],
     zRates: [-3, 0, 3],
     weights: { path: 0.5, target: 1.0, energy: 0.35, weather: 2.2, separation: 3.5, turn: 0.2, altitude: 0.5 },
-    voFallbackMarginM: 24, // trigger VO when predicted clearance falls below this
+    voFallbackMarginM: 28, // trigger VO when predicted clearance falls below this
   },
 
   vo: {
-    horizonS: 3,
+    horizonS: 4,
     marginM: 18,
     untrustedExtraMarginM: 12,
   },
