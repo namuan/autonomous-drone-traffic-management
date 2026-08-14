@@ -100,6 +100,7 @@ export class SimulationEngine {
   private tickCounter = 0;
   private simTimeS = 0;
   private paused: boolean;
+  private initialPaused: boolean;
   private tickMs: number;
 
   private drones = new Map<string, InternalDrone>();
@@ -129,7 +130,8 @@ export class SimulationEngine {
     this.scenario = makeScenarioCopy(this.originalScenario);
     this.rng = new SeededRandom(this.seed);
     this.weatherRng = this.rng.branch(0x5eed);
-    this.paused = opts.startPaused ?? false;
+    this.initialPaused = opts.startPaused ?? false;
+    this.paused = this.initialPaused;
     this.tickMs = opts.tickMs ?? CONFIG.engine.tickMs;
     this.init();
   }
@@ -157,6 +159,7 @@ export class SimulationEngine {
     this.weatherActive = false;
     this.weatherIntensity = 0.8;
     this.weatherNextSpawnS = 10;
+    this.paused = this.initialPaused;
     this.counters = this.zeroCounters();
     this.recentEvents = [];
     this.meshLinks = [];
@@ -649,8 +652,12 @@ export class SimulationEngine {
 
   private retargetToLanding(d: InternalDrone): void {
     if (this.simTimeS < d.retargetRetryAtS) return;
-    const site = this.nearestLandingSite(d.pos);
-    if (!site) return;
+    const site = this.nearestAvailableLandingSite(d);
+    if (!site) {
+      d.retargetRetryAtS = this.simTimeS + 5;
+      this.gateway.push("contract-rejected", `${d.spec.callsign}: no landing pad with capacity - retrying`, { droneId: d.spec.id });
+      return;
+    }
     const obstacles = this.currentObstacles();
     const start = { ...d.pos, z: d.pos.z };
     const raw = planAStar(start, site.pos, obstacles) ?? planRrt(start, site.pos, obstacles, d.rng.branch(555));
@@ -742,10 +749,15 @@ export class SimulationEngine {
   private assignMission(d: InternalDrone): void {
     const rng = d.rng;
     if (d.spec.role === "delivery") {
-      // Reserve a destination pad with spare capacity (exclude the spawn pad).
-      const candidates = this.scenario.landingSites.filter((s) => s.id !== d.spawnSiteId && s.used < s.capacity);
-      const pool = candidates.length > 0 ? candidates : this.scenario.landingSites.filter((s) => s.id !== d.spawnSiteId);
-      const target = rng.pick(pool.length > 0 ? pool : this.scenario.landingSites);
+      // Reserve a destination pad with spare capacity, preferring non-spawn
+      // pads. Never overbook: when every pad is full (or only the spawn pad
+      // has space in a single-pad scenario), fall through so stepRequesting
+      // waits and retries.
+      const withCapacity = this.scenario.landingSites.filter((s) => s.used < s.capacity);
+      let pool = withCapacity.filter((s) => s.id !== d.spawnSiteId);
+      if (pool.length === 0) pool = withCapacity;
+      if (pool.length === 0) return;
+      const target = rng.pick(pool);
       target.used++;
       d.reservedSiteId = target.id;
       d.mission = {
@@ -929,13 +941,20 @@ export class SimulationEngine {
     }
   }
 
-  private nearestLandingSite(pos: Point3): LandingSite | null {
+  /**
+   * Nearest landing site that may accept this drone: either the pad it
+   * already holds a reservation for, or a pad with spare capacity. Returns
+   * null when every pad is over capacity - the emergency then keeps the
+   * current contract and retries on cooldown.
+   */
+  private nearestAvailableLandingSite(d: InternalDrone): LandingSite | null {
     let best: LandingSite | null = null;
     let bestD = Infinity;
     for (const s of this.scenario.landingSites) {
-      const d = dist2(pos.x, pos.y, s.pos.x, s.pos.y);
-      if (d < bestD) {
-        bestD = d;
+      if (s.id !== d.reservedSiteId && s.used >= s.capacity) continue;
+      const dist = dist2(d.pos.x, d.pos.y, s.pos.x, s.pos.y);
+      if (dist < bestD) {
+        bestD = dist;
         best = s;
       }
     }
@@ -1036,8 +1055,12 @@ export class SimulationEngine {
   private attemptLostLinkRetarget(d: InternalDrone): void {
     if (d.lostLinkTargeted || !d.mission) return;
     if (this.simTimeS < d.retargetRetryAtS) return;
-    const site = this.nearestLandingSite(d.pos);
-    if (!site) return;
+    const site = this.nearestAvailableLandingSite(d);
+    if (!site) {
+      d.retargetRetryAtS = this.simTimeS + 5;
+      this.gateway.push("contract-rejected", `${d.spec.callsign}: no landing pad with capacity - retrying`, { droneId: d.spec.id });
+      return;
+    }
     const obstacles = this.currentObstacles();
     const start = { ...d.pos, z: d.pos.z };
     const raw = planAStar(start, site.pos, obstacles) ?? planRrt(start, site.pos, obstacles, d.rng.branch(777));

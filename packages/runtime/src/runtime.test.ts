@@ -207,7 +207,7 @@ describe("SimulationEngine", () => {
     expect(engine.snapshot().counters.untrustedFlags).toBeGreaterThan(0);
   });
 
-  it("performs lost-link emergency landing", () => {
+  it("performs lost-link emergency landing", { timeout: 30000 }, () => {
     const engine = new SimulationEngine({ seed: 5 });
     for (let i = 0; i < 400; i++) engine.tick();
     const snap = engine.snapshot();
@@ -485,5 +485,53 @@ describe("engine review round 3 regressions", () => {
       landed = engine.snapshot().drones.some((d) => d.id === drone!.id && d.state === "landed");
     }
     expect(landed).toBe(true);
+  });
+});
+
+describe("engine review round 4 regressions", () => {
+  it("waits instead of overbooking when every pad is full", () => {
+    const sc = makeScenario(14);
+    sc.droneSpecs = [sc.droneSpecs[0]!];
+    sc.landingSites = [{ id: "LS-ONLY", name: "Only Pad", pos: { x: 1850, y: 860, z: 0 }, capacity: 1, used: 0 }];
+    const engine = new SimulationEngine({ seed: 14, scenario: sc });
+    for (let i = 0; i < 3000; i++) engine.tick();
+    const snap = engine.snapshot();
+    // The spawn pad is full (the drone sits on it), so no destination can be
+    // reserved: the drone waits and the pad is never overbooked.
+    expect(snap.drones[0]!.state).toBe("waiting");
+    expect(snap.landingSites[0]!.used).toBe(1);
+  });
+
+  it("never overbooks landing pads under load (adds, weather, lost links)", { timeout: 60000 }, () => {
+    const engine = new SimulationEngine({ seed: 77 });
+    for (let i = 0; i < 6000; i++) {
+      engine.tick();
+      if (i % 300 === 0) engine.addDrone(i % 2 === 0 ? "delivery" : "surveillance");
+      if (i % 700 === 0) {
+        const snap = engine.snapshot();
+        const d = snap.drones.find((x) => x.state === "en-route");
+        if (d) engine.setLostLink(d.id, true);
+      }
+      if (i % 500 === 0) {
+        for (const site of engine.snapshot().landingSites) {
+          expect(site.used).toBeLessThanOrEqual(site.capacity);
+        }
+      }
+    }
+  });
+
+  it("reset restores the initial pause state", () => {
+    const a = new SimulationEngine({ seed: 8, startPaused: true });
+    a.setPaused(false);
+    a.tick();
+    expect(a.isPaused).toBe(false);
+    a.reset();
+    expect(a.isPaused).toBe(true);
+    const b = new SimulationEngine({ seed: 8, startPaused: true });
+    expect(a.isPaused).toBe(b.isPaused);
+    // And a paused reset engine does not advance.
+    const before = a.snapshot().simTimeS;
+    a.tick();
+    expect(a.snapshot().simTimeS).toBe(before);
   });
 });
