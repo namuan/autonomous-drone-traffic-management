@@ -535,3 +535,73 @@ describe("engine review round 4 regressions", () => {
     expect(a.snapshot().simTimeS).toBe(before);
   });
 });
+
+describe("engine review round 5 regressions", () => {
+  it("rejects addDrone when every landing pad is full", () => {
+    const sc = makeScenario(15);
+    sc.droneSpecs = [sc.droneSpecs[0]!];
+    sc.landingSites = [{ id: "LS-ONLY", name: "Only Pad", pos: { x: 1850, y: 860, z: 0 }, capacity: 1, used: 0 }];
+    const engine = new SimulationEngine({ seed: 15, scenario: sc });
+    for (let i = 0; i < 200; i++) engine.tick();
+    const countBefore = engine.droneCount;
+    const usedBefore = engine.snapshot().landingSites[0]!.used;
+    const res = engine.addDrone("delivery");
+    expect(res.ok).toBe(false);
+    expect(res.message).toContain("pads are full");
+    expect(engine.droneCount).toBe(countBefore);
+    expect(engine.snapshot().landingSites[0]!.used).toBe(usedBefore);
+    // No phantom drone spawned anywhere.
+    expect(engine.snapshot().drones.every((d) => d.x !== 500 || d.y !== 500)).toBe(true);
+  });
+
+  it("surveillance home pads stay reserved during flight and free on landing", () => {
+    const sc = makeScenario(16);
+    sc.droneSpecs = [sc.droneSpecs.find((s) => s.role === "surveillance")!];
+    sc.landingSites = [{ id: "LS-ONLY", name: "Only Pad", pos: { x: 300, y: 860, z: 0 }, capacity: 1, used: 0 }];
+    const engine = new SimulationEngine({ seed: 16, scenario: sc });
+    let sawEnRoute = false;
+    let landed = false;
+    for (let i = 0; i < 20000 && !landed; i++) {
+      engine.tick();
+      const snap = engine.snapshot();
+      const d = snap.drones[0];
+      if (!d) break;
+      if (d.state === "en-route") {
+        sawEnRoute = true;
+        expect(snap.landingSites[0]!.used).toBe(1); // home pad reserved during flight
+      }
+      if (d.state === "landed") {
+        landed = true;
+        expect(snap.landingSites[0]!.used).toBe(0);
+      }
+    }
+    expect(sawEnRoute).toBe(true);
+    expect(landed).toBe(true);
+  });
+
+  it("removes landed drones shortly after landing and frees sector capacity", { timeout: 60000 }, () => {
+    const sc = makeScenario(17);
+    sc.droneSpecs = [sc.droneSpecs[0]!];
+    sc.landingSites = [
+      { id: "LS-A", name: "Pad A", pos: { x: 1850, y: 860, z: 0 }, capacity: 2, used: 0 },
+      { id: "LS-B", name: "Pad B", pos: { x: 300, y: 60, z: 0 }, capacity: 2, used: 0 },
+    ];
+    const engine = new SimulationEngine({ seed: 17, scenario: sc });
+    let landedAt = -1;
+    for (let i = 0; i < 20000; i++) {
+      engine.tick();
+      if (landedAt < 0 && engine.snapshot().drones.some((d) => d.state === "landed")) {
+        landedAt = i;
+        break;
+      }
+    }
+    expect(landedAt).toBeGreaterThan(0);
+    expect(engine.droneCount).toBe(1); // still present right after landing
+    // The drone leaves after ~20 s (200 ticks) and the pad becomes spawnable.
+    for (let i = 0; i < 400 && engine.droneCount > 0; i++) engine.tick();
+    expect(engine.droneCount).toBe(0);
+    const res = engine.addDrone("delivery");
+    expect(res.ok).toBe(true);
+    expect(engine.droneCount).toBe(1);
+  });
+});

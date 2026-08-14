@@ -212,6 +212,12 @@ export class SimulationEngine {
 
     this.stepWeather(dt);
     for (const d of [...this.drones.values()]) this.stepDrone(d, dt);
+    // Post-landing lifecycle: drones leave the sector shortly after landing.
+    for (const [id, d] of [...this.drones]) {
+      if (d.state === "landed" && d.removeAtS !== null && this.simTimeS >= d.removeAtS) {
+        this.drones.delete(id);
+      }
+    }
     this.computeMeshLinks();
     this.checkSeparation();
     this.recordTelemetry();
@@ -271,8 +277,9 @@ export class SimulationEngine {
 
   // ----------------------------------------------------------------- drones
 
-  private spawnDrone(spec: DroneSpec, initial: boolean): InternalDrone {
+  private spawnDrone(spec: DroneSpec, initial: boolean): InternalDrone | null {
     const site = this.pickSpawnSite(spec.role, initial);
+    if (!site) return null;
     const sitePos = site ? { x: site.pos.x, y: site.pos.y, z: 0 } : { x: 500, y: 500, z: 0 };
     const d: InternalDrone = {
       spec,
@@ -691,9 +698,17 @@ export class SimulationEngine {
     d.targetLabel = `emergency: ${site.name}`;
   }
 
-  /** Free the pad the drone spawned from (at departure or on emergency). */
+  /** Free the pad the drone spawned from (at departure or on emergency).
+   * Surveillance drones transfer their spawn allocation into the landing
+   * reservation (no double count); delivery drones always reserve their
+   * destination separately, so their spawn slot is released normally even
+   * when it happens to equal the destination pad. */
   private releaseSpawnSlot(d: InternalDrone): void {
     if (!d.spawnSiteId) return;
+    if (d.reservedSiteId === d.spawnSiteId && d.spec.role === "surveillance") {
+      d.spawnSiteId = null; // allocation transfers to the landing reservation
+      return;
+    }
     const site = this.scenario.landingSites.find((s) => s.id === d.spawnSiteId);
     if (site) site.used = Math.max(0, site.used - 1);
     d.spawnSiteId = null;
@@ -791,6 +806,9 @@ export class SimulationEngine {
         maxSpeed: d.spec.maxSpeed,
         home,
       };
+      // The home pad is the spawn pad: keep its allocation as the landing
+      // reservation (no increment - the spawn slot already counts it).
+      d.reservedSiteId = d.spawnSiteId;
     }
   }
 
@@ -979,6 +997,11 @@ export class SimulationEngine {
     if (this.drones.size >= CONFIG.engine.maxDrones) {
       return { ok: false, message: "Sector at capacity" };
     }
+    // Admission control: every drone needs a pad to spawn on.
+    const available = this.scenario.landingSites.some((site) => site.used < site.capacity);
+    if (!available) {
+      return { ok: false, message: "All landing pads are full - cannot spawn" };
+    }
     const cfg = CONFIG.drones[role];
     const name = `ADD${String(this.droneSerial).padStart(3, "0")}`;
     const spec: DroneSpec = {
@@ -992,7 +1015,10 @@ export class SimulationEngine {
       zLanes: [...cfg.zLanes],
       payloadKg: role === "delivery" ? 2.5 : 0.8,
     };
-    this.spawnDrone(spec, false);
+    const spawned = this.spawnDrone(spec, false);
+    if (!spawned) {
+      return { ok: false, message: "All landing pads are full - cannot spawn" };
+    }
     return { ok: true, droneId: spec.id, message: `${spec.callsign} (${role}) spawned` };
   }
 
