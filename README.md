@@ -12,6 +12,26 @@ a live web console.
 > airworthiness software.** See [docs/safety-scope.md](./docs/safety-scope.md)
 > for exactly what is and is not claimed.
 
+## Screenshots
+
+The sector operations console — no-fly geofences, landing pads, delivery
+(cyan) and surveillance (violet) drones with planned routes, fading trails
+and 18 m detection rings:
+
+![UTM Sector A1 operations console with active drone traffic](docs/screenshots/01-console.jpg)
+
+A weather event spawns turbulence cells and forces tactical reroutes; the
+selected-aircraft panel shows battery, contract conformance and the
+per-source fusion trust that drives spoofing detection:
+
+| Weather event and reroutes | Selected aircraft inspection |
+| --- | --- |
+| ![Turbulence cells forcing drone reroutes](docs/screenshots/02-weather.jpg) | ![Selected drone with fusion trust panel](docs/screenshots/04-drone-detail.jpg) |
+
+The console adapts to narrow screens:
+
+![UTM console mobile layout](docs/screenshots/03-mobile.jpg)
+
 ## Quick start
 
 Requires Node.js >= 20 and pnpm (10+).
