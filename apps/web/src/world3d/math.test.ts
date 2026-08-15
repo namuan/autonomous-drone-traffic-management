@@ -11,7 +11,9 @@ import {
   damp,
   droneScenePos,
   fpvCaptureActive,
+  cameraYawForFpv,
   fpvDirection,
+  fpvLook,
   fpvRight,
   fpvStep,
   flightModeState,
@@ -215,10 +217,53 @@ describe("FPV flight math", () => {
     expect(up.z).toBeCloseTo(Math.SQRT1_2, 10);
   });
 
-  it("strafe right is perpendicular to the heading", () => {
-    const r = fpvRight(0);
-    expect(r.x).toBeCloseTo(1, 10);
-    expect(r.z).toBeCloseTo(0, 10);
+  it("strafe right is the camera's screen-right (forward x up)", () => {
+    // Camera facing +Z (yaw 0) has its right at -X in a right-handed world;
+    // facing +X (yaw 90) has its right at +Z.
+    const r0 = fpvRight(0);
+    expect(r0.x).toBeCloseTo(-1, 10);
+    expect(r0.z).toBeCloseTo(0, 10);
+    const r90 = fpvRight(Math.PI / 2);
+    expect(r90.x).toBeCloseTo(0, 10);
+    expect(r90.z).toBeCloseTo(1, 10);
+    const rpi = fpvRight(Math.PI);
+    expect(rpi.x).toBeCloseTo(1, 10);
+    expect(rpi.z).toBeCloseTo(0, 10);
+  });
+
+  it("camera rotation makes the camera face the FPV direction", () => {
+    // forward = R_y(cameraYawForFpv(yaw)) * R_x(pitch) * (0,0,-1)
+    for (const [yaw, pitch] of [
+      [0, 0],
+      [Math.PI / 2, 0],
+      [Math.PI, -0.3],
+      [-1, 0.4],
+      [3, 1.2],
+    ]) {
+      const d = fpvDirection(yaw, pitch);
+      const cy = cameraYawForFpv(yaw);
+      const cp = Math.cos(pitch);
+      const sp = Math.sin(pitch);
+      // R_y(cy) applied to R_x(pitch)*(0,0,-1) = (0, sp, -cp):
+      const fx = Math.sin(cy) * -cp;
+      const fy = sp;
+      const fz = Math.cos(cy) * -cp;
+      expect(d.x).toBeCloseTo(fx, 10);
+      expect(d.y).toBeCloseTo(fy, 10);
+      expect(d.z).toBeCloseTo(fz, 10);
+    }
+  });
+
+  it("mouse look is not inverted: right turns right, up looks up", () => {
+    const right = fpvLook(0, 0, 100, 0);
+    expect(right.yaw).toBeLessThan(0); // mouse right -> yaw decreases -> view turns toward screen-right
+    const up = fpvLook(0, 0, 0, -100);
+    expect(up.pitch).toBeGreaterThan(0); // mouse up -> pitch increases
+    const down = fpvLook(0, 0, 0, 100);
+    expect(down.pitch).toBeLessThan(0);
+    // The view direction rotates toward the camera's screen-right.
+    const after = fpvDirection(right.yaw, 0);
+    expect(after.x).toBeCloseTo(-Math.sin(100 * 0.0022), 10);
   });
 
   it("normalizes diagonal input so speed never exceeds the base", () => {
@@ -233,8 +278,9 @@ describe("FPV flight math", () => {
     const speedOf = (p: { vel: { x: number; y: number; z: number } }) => Math.hypot(p.vel.x, p.vel.y, p.vel.z);
     expect(speedOf(straight)).toBeCloseTo(FPV_BASE_SPEED, 1);
     expect(speedOf(diagonal)).toBeLessThanOrEqual(FPV_BASE_SPEED + 0.01);
-    // Equal speeds -> each diagonal leg is the straight leg / sqrt(2).
-    expect(diagonal.pos.x).toBeCloseTo(straight.pos.z / Math.SQRT2, 0);
+    // Equal speeds -> each diagonal leg is the straight leg / sqrt(2); at
+    // yaw 0 the strafe component moves toward -X (camera screen-right).
+    expect(diagonal.pos.x).toBeCloseTo(-straight.pos.z / Math.SQRT2, 0);
   });
 
   it("accelerates with damping and decays to rest without input", () => {

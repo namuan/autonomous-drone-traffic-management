@@ -15,8 +15,8 @@ import type { DroneView, Snapshot, WeatherZone } from "@utm/core";
 import {
   BG_HEX,
   FPV_BOOST,
-  FPV_SENSITIVITY,
   ROLE_HEX,
+  cameraYawForFpv,
   classifyGesture,
   clampPitch,
   damp,
@@ -24,6 +24,7 @@ import {
   followState,
   fpvCaptureActive,
   fpvDirection,
+  fpvLook,
   fpvStep,
   headingYawRad,
   interpAlpha,
@@ -209,7 +210,7 @@ export class World3D {
     if (this.mode.kind === "fpv") {
       this.camera.position.set(FPV_SPAWN.x, FPV_SPAWN.y, FPV_SPAWN.z);
       this.camera.rotation.order = "YXZ";
-      this.camera.rotation.y = FPV_SPAWN_YAW;
+      this.camera.rotation.y = cameraYawForFpv(FPV_SPAWN_YAW);
       this.camera.rotation.x = FPV_SPAWN_PITCH;
     } else {
       this.camera.position.set(0, 1500, 2050);
@@ -323,7 +324,7 @@ export class World3D {
       this.fpv.vel.set(0, 0, 0);
       this.camera.position.copy(this.fpv.pos);
       this.camera.rotation.order = "YXZ";
-      this.camera.rotation.y = this.fpv.yaw;
+      this.camera.rotation.y = cameraYawForFpv(this.fpv.yaw);
       this.camera.rotation.x = this.fpv.pitch;
     } else if (next.kind === "orbit") {
       this.controls.enabled = true;
@@ -1090,8 +1091,9 @@ export class World3D {
 
   private onMouseMove = (e: MouseEvent): void => {
     if (!fpvCaptureActive(this.mode.kind, this.locked)) return;
-    this.fpv.yaw = wrapYaw(this.fpv.yaw + e.movementX * FPV_SENSITIVITY);
-    this.fpv.pitch = clampPitch(this.fpv.pitch - e.movementY * FPV_SENSITIVITY);
+    const look = fpvLook(this.fpv.yaw, this.fpv.pitch, e.movementX, e.movementY);
+    this.fpv.yaw = look.yaw;
+    this.fpv.pitch = look.pitch;
   };
 
   private onPointerLockChange = (): void => {
@@ -1202,7 +1204,7 @@ export class World3D {
     }
     this.camera.position.copy(this.fpv.pos);
     this.camera.rotation.order = "YXZ";
-    this.camera.rotation.y = this.fpv.yaw;
+    this.camera.rotation.y = cameraYawForFpv(this.fpv.yaw);
     this.camera.rotation.x = this.fpv.pitch;
 
     // HUD telemetry (sector-frame position).

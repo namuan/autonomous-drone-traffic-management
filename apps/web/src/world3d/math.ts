@@ -155,9 +155,35 @@ export function fpvDirection(yawRad: number, pitchRad: number): Vec3 {
   return { x: Math.sin(yawRad) * cp, y: Math.sin(pitchRad), z: Math.cos(yawRad) * cp };
 }
 
-/** Horizontal right vector for strafing. */
+/**
+ * Horizontal screen-right of the FPV camera (= forward x up). Verified
+ * against three.js camera matrix columns: with yaw 0 the camera faces +Z
+ * and its right is -X (right-handed world).
+ */
 export function fpvRight(yawRad: number): Vec3 {
-  return { x: Math.cos(yawRad), y: 0, z: -Math.sin(yawRad) };
+  return { x: -Math.cos(yawRad), y: 0, z: Math.sin(yawRad) };
+}
+
+/**
+ * Camera rotation.y that makes the camera face fpvDirection(yaw): three.js
+ * cameras look down -Z, so rotation.y must be offset by pi.
+ */
+export const cameraYawForFpv = (yawRad: number): number => wrapYaw(yawRad + Math.PI);
+
+/**
+ * Pointer-look integration (mouse right = dx > 0 turns the view right;
+ * mouse up = dy < 0 pitches up).
+ */
+export function fpvLook(
+  yawRad: number,
+  pitchRad: number,
+  movementXPx: number,
+  movementYPx: number
+): { yaw: number; pitch: number } {
+  return {
+    yaw: wrapYaw(yawRad - movementXPx * FPV_SENSITIVITY),
+    pitch: clampPitch(pitchRad - movementYPx * FPV_SENSITIVITY),
+  };
 }
 
 export const wrapYaw = (yawRad: number): number => {
