@@ -2,17 +2,30 @@ import { describe, expect, it } from "vitest";
 import type { DroneView, Snapshot } from "@utm/core";
 import {
   BG_HEX,
+  FPV_BASE_SPEED,
+  FPV_BOOST,
+  FPV_PITCH_LIMIT,
+  cameraMarkerRotation,
   classifyGesture,
+  clampPitch,
   damp,
   droneScenePos,
+  fpvCaptureActive,
+  fpvDirection,
+  fpvRight,
+  fpvStep,
+  flightModeState,
+  followState,
   headingYawRad,
   hexToRgb,
   interpAlpha,
   lerp3,
+  releaseFollowState,
   ringsFor,
   sceneToWorld,
   trailFade,
   worldToScene,
+  wrapYaw,
   type SimFrame,
 } from "./math.js";
 
@@ -185,5 +198,133 @@ describe("gesture + smoothing", () => {
     expect(headingYawRad(0)).toBeCloseTo(0, 10);
     expect(headingYawRad(90)).toBeCloseTo(-Math.PI / 2, 10);
     expect(headingYawRad(180)).toBeCloseTo(-Math.PI, 10);
+  });
+});
+
+describe("FPV flight math", () => {
+  it("derives the look direction from yaw/pitch", () => {
+    const d0 = fpvDirection(0, 0);
+    expect(d0.x).toBeCloseTo(0, 10);
+    expect(d0.y).toBeCloseTo(0, 10);
+    expect(d0.z).toBeCloseTo(1, 10); // yaw 0 faces +Z (north)
+    const e = fpvDirection(Math.PI / 2, 0);
+    expect(e.x).toBeCloseTo(1, 10);
+    expect(e.z).toBeCloseTo(0, 10);
+    const up = fpvDirection(0, Math.PI / 4);
+    expect(up.y).toBeCloseTo(Math.SQRT1_2, 10);
+    expect(up.z).toBeCloseTo(Math.SQRT1_2, 10);
+  });
+
+  it("strafe right is perpendicular to the heading", () => {
+    const r = fpvRight(0);
+    expect(r.x).toBeCloseTo(1, 10);
+    expect(r.z).toBeCloseTo(0, 10);
+  });
+
+  it("normalizes diagonal input so speed never exceeds the base", () => {
+    const dt = 16.7;
+    const run = (input: Parameters<typeof fpvStep>[1], steps = 150) => {
+      let pose = { pos: { x: 0, y: 50, z: 0 }, vel: { x: 0, y: 0, z: 0 } };
+      for (let i = 0; i < steps; i++) pose = fpvStep(pose, input, 0, 0, dt, 2000, 1000, 150);
+      return pose;
+    };
+    const straight = run({ fwd: 1, strafe: 0, up: 0, boost: 1 });
+    const diagonal = run({ fwd: 1, strafe: 1, up: 0, boost: 1 });
+    const speedOf = (p: { vel: { x: number; y: number; z: number } }) => Math.hypot(p.vel.x, p.vel.y, p.vel.z);
+    expect(speedOf(straight)).toBeCloseTo(FPV_BASE_SPEED, 1);
+    expect(speedOf(diagonal)).toBeLessThanOrEqual(FPV_BASE_SPEED + 0.01);
+    // Equal speeds -> each diagonal leg is the straight leg / sqrt(2).
+    expect(diagonal.pos.x).toBeCloseTo(straight.pos.z / Math.SQRT2, 0);
+  });
+
+  it("accelerates with damping and decays to rest without input", () => {
+    let pose = { pos: { x: 0, y: 50, z: 0 }, vel: { x: 0, y: 0, z: 0 } };
+    pose = fpvStep(pose, { fwd: 1, strafe: 0, up: 0, boost: 1 }, 0, 0, 16.7, 2000, 1000, 150);
+    expect(pose.vel.z).toBeLessThan(FPV_BASE_SPEED); // still accelerating
+    for (let i = 0; i < 200; i++) pose = fpvStep(pose, { fwd: 0, strafe: 0, up: 0, boost: 1 }, 0, 0, 16.7, 2000, 1000, 150);
+    expect(Math.hypot(pose.vel.x, pose.vel.y, pose.vel.z)).toBeLessThan(0.001);
+  });
+
+  it("applies boost as a speed multiplier", () => {
+    let pose = { pos: { x: 0, y: 50, z: 0 }, vel: { x: 0, y: 0, z: 0 } };
+    for (let i = 0; i < 200; i++) pose = fpvStep(pose, { fwd: 1, strafe: 0, up: 0, boost: 2 }, 0, 0, 16.7, 2000, 1000, 150);
+    expect(Math.hypot(pose.vel.x, pose.vel.y, pose.vel.z)).toBeCloseTo(FPV_BASE_SPEED * FPV_BOOST, 1);
+    expect(pose.pos.z).toBeLessThan(492); // stayed inside the sector footprint
+  });
+
+  it("clamps to the sector footprint and zeroes clamped velocity", () => {
+    let pose = { pos: { x: 0, y: 50, z: 0 }, vel: { x: 0, y: 0, z: 0 } };
+    for (let i = 0; i < 700; i++) pose = fpvStep(pose, { fwd: 1, strafe: 0, up: 0, boost: 1 }, 0, 0, 16.7, 2000, 1000, 150);
+    expect(pose.pos.z).toBeLessThanOrEqual(500 - 8 + 0.001);
+    expect(pose.vel.z).toBe(0);
+    // Climbing above the ceiling is also stopped.
+    pose = { pos: { x: 0, y: 50, z: 0 }, vel: { x: 0, y: 0, z: 0 } };
+    for (let i = 0; i < 400; i++) pose = fpvStep(pose, { fwd: 0, strafe: 0, up: 1, boost: 1 }, 0, 0, 16.7, 2000, 1000, 150);
+    expect(pose.pos.y).toBeLessThanOrEqual(150 + 120 + 0.001);
+    expect(pose.vel.y).toBe(0);
+  });
+
+  it("caps long frame deltas", () => {
+    const pose = { pos: { x: 0, y: 50, z: 0 }, vel: { x: 55, y: 0, z: 0 } };
+    const stepped = fpvStep(pose, { fwd: 0, strafe: 0, up: 0, boost: 1 }, 0, 0, 5000, 2000, 1000, 150);
+    expect(stepped.pos.x).toBeLessThan(0.25 * 55 + 1); // dt capped at 250 ms
+  });
+
+  it("wraps yaw and clamps pitch", () => {
+    expect(wrapYaw(Math.PI * 1.5)).toBeCloseTo(-Math.PI / 2, 10);
+    expect(wrapYaw(-Math.PI * 1.5)).toBeCloseTo(Math.PI / 2, 10);
+    expect(wrapYaw(Math.PI)).toBeCloseTo(-Math.PI, 10);
+    expect(clampPitch(2)).toBeCloseTo(FPV_PITCH_LIMIT, 10);
+    expect(clampPitch(-2)).toBeCloseTo(-FPV_PITCH_LIMIT, 10);
+    expect(clampPitch(0.2)).toBe(0.2);
+  });
+
+  it("captures keys only in FPV mode while locked", () => {
+    expect(fpvCaptureActive("fpv", true)).toBe(true);
+    expect(fpvCaptureActive("fpv", false)).toBe(false);
+    expect(fpvCaptureActive("orbit", true)).toBe(false);
+    expect(fpvCaptureActive("follow", true)).toBe(false);
+  });
+
+  it("orients the minimap marker for a screen-down north", () => {
+    // 0 deg (facing +Z) points screen-down; +90 deg (east) points screen-right.
+    expect(Math.sin(cameraMarkerRotation(0))).toBeCloseTo(0, 10);
+    expect(Math.cos(cameraMarkerRotation(0))).toBeCloseTo(-1, 10);
+    expect(Math.sin(cameraMarkerRotation(90))).toBeCloseTo(1, 10);
+    expect(Math.cos(cameraMarkerRotation(90))).toBeCloseTo(0, 10);
+    expect(Math.sin(cameraMarkerRotation(180))).toBeCloseTo(0, 10);
+    expect(Math.cos(cameraMarkerRotation(180))).toBeCloseTo(1, 10);
+    expect(Math.sin(cameraMarkerRotation(270))).toBeCloseTo(-1, 10);
+    expect(Math.cos(cameraMarkerRotation(270))).toBeCloseTo(0, 10);
+  });
+});
+
+describe("camera mode state machine", () => {
+  it("follow release returns to the preferred flight mode", () => {
+    const following = { kind: "follow" as const, droneId: "d1" };
+    expect(releaseFollowState(following, "fpv")).toEqual({ kind: "fpv", droneId: null });
+    expect(releaseFollowState(following, "orbit")).toEqual({ kind: "orbit", droneId: null });
+  });
+
+  it("release is a no-op when not following", () => {
+    const orbit = { kind: "orbit" as const, droneId: null };
+    expect(releaseFollowState(orbit, "fpv")).toBe(orbit);
+  });
+
+  it("follow engagement keeps the preferred mode untouched", () => {
+    const state = followState({ kind: "fpv", droneId: null }, "fpv", "d7");
+    expect(state).toEqual({ kind: "follow", droneId: "d7" });
+  });
+
+  it("re-following the same drone is a no-op; a new target replaces it", () => {
+    const state = { kind: "follow" as const, droneId: "d1" };
+    expect(followState(state, "orbit", "d1")).toBe(state);
+    expect(followState(state, "orbit", "d2")).toEqual({ kind: "follow", droneId: "d2" });
+    expect(followState(state, "orbit", null)).toEqual({ kind: "orbit", droneId: null });
+  });
+
+  it("flight mode selection never produces follow", () => {
+    expect(flightModeState("fpv")).toEqual({ kind: "fpv", droneId: null });
+    expect(flightModeState("orbit")).toEqual({ kind: "orbit", droneId: null });
   });
 });

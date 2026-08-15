@@ -178,10 +178,29 @@ try {
           }
         }
       });
+      await page.keyboard.press("Escape"); // release any pointer lock the clicks acquired
       await page.waitForSelector('[data-testid="drone-details"]', { timeout: 5000 }).catch(() => null);
     }
     const panel3d = await page.locator('[data-testid="drone-details"]').count();
     check("selection persists into 3D view", panel3d === 1);
+
+    // FPV is the default camera mode with its game HUD.
+    const fpvBtn = await page.locator('.world3d-toolbar button:has-text("FPV")').getAttribute("class");
+    check("FPV is the default 3D camera mode", (fpvBtn ?? "").includes("active"));
+    await page.waitForSelector(".fpv-telemetry", { timeout: 5000 });
+    const hudOk =
+      (await page.locator(".fpv-telemetry").count()) === 1 &&
+      (await page.locator(".fpv-minimap canvas").count()) === 1 &&
+      (await page.locator(".fpv-crosshair").count()) === 1;
+    check("FPV game HUD (telemetry, minimap, crosshair) present", hudOk);
+
+    // Mode switching: orbit shows the compass, FPV returns the HUD.
+    await page.click('.world3d-toolbar button:has-text("ORBIT")');
+    await page.waitForSelector(".world3d-compass", { timeout: 5000 });
+    check("ORBIT mode switch returns compass", true);
+    await page.click('.world3d-toolbar button:has-text("FPV")');
+    await page.waitForSelector(".fpv-telemetry", { timeout: 5000 });
+    check("switch back to FPV mode", true);
 
     // Fullscreen overlay engages and exits.
     await page.click('.world3d-toolbar button:has-text("FULLSCREEN")');

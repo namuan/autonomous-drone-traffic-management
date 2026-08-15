@@ -90,8 +90,10 @@ Dependency direction: `core -> autonomy -> runtime -> apps`.
   conformance, battery)
 - Two views via the topbar switcher: **2D OPS** (top-down console) and
   **3D WORLD** (immersive WebGL2 scene — same snapshots, shared selection;
-  single click = select, double-click = follow cam, `F` follow, `Shift+F`
-  fullscreen, `Esc` exit/back; falls back gracefully without WebGL2)
+  FPV spectator flight by default: click to capture the mouse, `WASD` fly,
+  `Space`/`X` up/down, `Shift` boost, game HUD with crosshair, telemetry and
+  minimap; `ORBIT` overview, `F` follow cam, `Shift+F` fullscreen, `Esc`
+  exit/back; falls back gracefully without WebGL2)
 - Keyboard: `Space` pause · `W` weather · `D`/`V` add drone · `R` reset ·
   `Esc` deselect
 

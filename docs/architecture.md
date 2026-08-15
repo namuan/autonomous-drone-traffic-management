@@ -118,6 +118,23 @@ simulation state.
   lazy-loaded (separate chunk) so the 2D bundle is unchanged. Pure coordinate
   and interpolation math lives in `world3d/math.ts` and is unit-tested.
 
+  Three camera modes (FPV is the default on pointer-capable devices):
+
+  - **FPV** — a first-person, game-style spectator camera. Click the canvas
+    to capture the mouse (Pointer Lock); `WASD` fly along the look vector,
+    `Space`/`X` climb/descend, `Shift` boosts, mouse looks. Movement is
+    exponentially damped and clamped to the sector footprint and airspace
+    envelope. The HUD shows a crosshair, flight telemetry (speed, altitude,
+    heading, position), a live minimap (lightweight canvas renderer in
+    `world3d/minimap.ts`), an amber tint inside weather cells, and a capture
+    hint. While captured, the sim hotkeys (`Space`/`W`/`D`/`V`/`R`) yield to
+    flight controls via an App-level capture flag; Esc releases the mouse.
+  - **ORBIT** — overview camera with damping, idle cinematic drift and the
+    compass.
+  - **FOLLOW** — chase camera behind a selected drone (`F` toggles, double-
+    click a drone engages); any follow session ends back in the preferred
+    flight mode (FPV or ORBIT).
+
 Shared mechanics:
 
 - `useSimulation` stores each WebSocket snapshot atomically as
@@ -130,6 +147,9 @@ Shared mechanics:
 - Shift+F toggles the immersive fullscreen overlay (floating HUD with
   clock, pause, exit). WebGL2 is required; without it the view shows a
   fallback with a Switch to 2D button and never claims to be active.
+- Pointer lock is the authoritative input state for FPV (never key events):
+  lock/unlock transitions clear held keys and velocity, and the click that
+  acquires the lock never selects a drone.
 
 ## Production adapter map
 

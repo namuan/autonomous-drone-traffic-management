@@ -14,16 +14,29 @@ import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
 import type { DroneView, Snapshot, WeatherZone } from "@utm/core";
 import {
   BG_HEX,
+  FPV_BOOST,
+  FPV_SENSITIVITY,
   ROLE_HEX,
   classifyGesture,
+  clampPitch,
   damp,
+  flightModeState,
+  followState,
+  fpvCaptureActive,
+  fpvDirection,
+  fpvStep,
   headingYawRad,
   interpAlpha,
   lerp3,
+  releaseFollowState,
   ringsFor,
   trailFade,
   worldToScene,
+  wrapYaw,
+  type CamModeState,
+  type FpvTelemetry,
   type SimFrame,
+  type Vec3,
 } from "./math.js";
 
 export interface World3DHandlers {
@@ -35,9 +48,17 @@ export interface World3DHandlers {
   onStatus?: (status: "ok" | "lost") => void;
   /** Follow camera engaged (droneId) or released (null). */
   onFollowChange?: (droneId: string | null) => void;
+  /** Pointer lock acquired/released on the canvas. */
+  onLockChange?: (locked: boolean) => void;
+  /** FPV keys active (mode fpv + pointer locked). */
+  onCaptureChange?: (captured: boolean) => void;
+  /** Active camera mode. */
+  onModeChange?: (mode: "fpv" | "orbit" | "follow") => void;
+  /** Per-frame FPV HUD telemetry. */
+  onFpvTelemetry?: (t: FpvTelemetry) => void;
 }
 
-type CameraMode = { kind: "orbit" } | { kind: "follow"; droneId: string };
+type CameraMode = CamModeState;
 
 const FOLLOW_DIST = 46;
 const FOLLOW_HEIGHT = 26;
@@ -46,6 +67,10 @@ const BODY_RADIUS_M = 2.5;
 const TRAIL_CAPACITY = 512;
 const SECTOR_W = 2000;
 const SECTOR_H = 1000;
+/** FPV spawn point (scene coords) + look toward the sector center. */
+const FPV_SPAWN = { x: 0, y: 55, z: 430 } as const;
+const FPV_SPAWN_YAW = Math.PI;
+const FPV_SPAWN_PITCH = -0.12;
 
 /**
  * Cheap change-detection signature for a polyline: length + first, middle
@@ -118,8 +143,24 @@ export class World3D {
 
   private frame: SimFrame | null = null;
   private selectedId: string | null = null;
-  private mode: CameraMode = { kind: "orbit" };
+  private mode: CameraMode;
+  /** Camera mode restored when a follow-chase session ends. */
+  private preferred: "fpv" | "orbit";
+  private fpvLockSupported: boolean;
   private lastInteraction = performance.now();
+
+  // FPV spectator state (scene coords).
+  private fpv = {
+    pos: new THREE.Vector3(FPV_SPAWN.x, FPV_SPAWN.y, FPV_SPAWN.z),
+    yaw: FPV_SPAWN_YAW,
+    pitch: FPV_SPAWN_PITCH,
+    vel: new THREE.Vector3(),
+    initialized: false,
+  };
+  private keys = new Set<string>();
+  private locked = false;
+  private suppressSelect = false;
+  private lastTelemetryValue: FpvTelemetry | null = null;
 
   private rigs = new Map<string, DroneRig>();
   private pickTargets: THREE.Mesh[] = [];
@@ -139,10 +180,18 @@ export class World3D {
   private pointerDown: { x: number; y: number } | null = null;
   private raycaster = new THREE.Raycaster();
 
-  constructor(container: HTMLElement, handlers: World3DHandlers, opts: { reducedMotion?: boolean } = {}) {
+  constructor(
+    container: HTMLElement,
+    handlers: World3DHandlers,
+    opts: { reducedMotion?: boolean; fpvSupported?: boolean } = {}
+  ) {
     this.container = container;
     this.handlers = handlers;
     this.reduced = opts.reducedMotion ?? false;
+    this.fpvLockSupported = opts.fpvSupported ?? false;
+    // FPV is the default on devices that can capture the pointer.
+    this.preferred = this.fpvLockSupported ? "fpv" : "orbit";
+    this.mode = flightModeState(this.preferred);
 
     const w = Math.max(1, container.clientWidth);
     const h = Math.max(1, container.clientHeight);
@@ -157,7 +206,14 @@ export class World3D {
     this.scene.fog = new THREE.Fog(BG_HEX, 700, 2900);
 
     this.camera = new THREE.PerspectiveCamera(55, w / h, 1, 6000);
-    this.camera.position.set(0, 1500, 2050);
+    if (this.mode.kind === "fpv") {
+      this.camera.position.set(FPV_SPAWN.x, FPV_SPAWN.y, FPV_SPAWN.z);
+      this.camera.rotation.order = "YXZ";
+      this.camera.rotation.y = FPV_SPAWN_YAW;
+      this.camera.rotation.x = FPV_SPAWN_PITCH;
+    } else {
+      this.camera.position.set(0, 1500, 2050);
+    }
 
     this.controls = new OrbitControls(this.camera, this.renderer.domElement);
     this.controls.enableDamping = true;
@@ -194,6 +250,13 @@ export class World3D {
     el.addEventListener("dblclick", this.onDblClick);
     el.addEventListener("webglcontextlost", this.onContextLost);
     this.controls.addEventListener("start", this.onControlsStart);
+    window.addEventListener("keydown", this.onKeyDown);
+    window.addEventListener("keyup", this.onKeyUp);
+    window.addEventListener("blur", this.onFocusLost);
+    document.addEventListener("visibilitychange", this.onFocusLost);
+    document.addEventListener("mousemove", this.onMouseMove);
+    document.addEventListener("pointerlockchange", this.onPointerLockChange);
+    document.addEventListener("pointerlockerror", this.onPointerLockError);
 
     this.resizeObs = new ResizeObserver(() => {
       const cw = this.container.clientWidth;
@@ -234,29 +297,123 @@ export class World3D {
     }
   }
 
+  /**
+   * Central mode switch. All mode changes go through here so camera/controls
+   * state, pointer lock, key capture, and handlers stay consistent.
+   */
+  private transition(next: CameraMode): void {
+    const prev = this.mode;
+    this.mode = next;
+    if (next.kind === "fpv") {
+      this.controls.enabled = false;
+      this.controls.autoRotate = false;
+      if (!this.fpv.initialized) {
+        // Fixed spawn for the first FPV entry of this scene.
+        this.fpv.pos.set(FPV_SPAWN.x, FPV_SPAWN.y, FPV_SPAWN.z);
+        this.fpv.yaw = FPV_SPAWN_YAW;
+        this.fpv.pitch = FPV_SPAWN_PITCH;
+        this.fpv.initialized = true;
+      } else if (prev.kind === "orbit" || prev.kind === "follow") {
+        // Continuous handoff: derive the pose from the current camera.
+        this.fpv.pos.copy(this.camera.position);
+        const dir = this.camera.getWorldDirection(new THREE.Vector3());
+        this.fpv.yaw = wrapYaw(Math.atan2(dir.x, dir.z));
+        this.fpv.pitch = clampPitch(Math.asin(dir.y));
+      }
+      this.fpv.vel.set(0, 0, 0);
+      this.camera.position.copy(this.fpv.pos);
+      this.camera.rotation.order = "YXZ";
+      this.camera.rotation.y = this.fpv.yaw;
+      this.camera.rotation.x = this.fpv.pitch;
+    } else if (next.kind === "orbit") {
+      this.controls.enabled = true;
+      if (prev.kind === "fpv" || prev.kind === "follow") {
+        // Hand off where the FPV camera ended up.
+        this.camera.position.copy(this.fpv.pos);
+        const dir = fpvDirection(this.fpv.yaw, this.fpv.pitch);
+        this.controls.target.set(
+          this.fpv.pos.x + dir.x * 80,
+          this.fpv.pos.y + dir.y * 80,
+          this.fpv.pos.z + dir.z * 80
+        );
+        this.camera.lookAt(this.controls.target);
+      }
+    } else {
+      // follow: normal pointer interaction is required.
+      this.controls.enabled = true;
+      this.controls.autoRotate = false;
+      // Remember where the camera is so follow-release can resume the pose.
+      this.fpv.pos.copy(this.camera.position);
+      const dir = this.camera.getWorldDirection(new THREE.Vector3());
+      this.fpv.yaw = wrapYaw(Math.atan2(dir.x, dir.z));
+      this.fpv.pitch = clampPitch(Math.asin(dir.y));
+      this.fpv.vel.set(0, 0, 0);
+      this.exitPointerLock();
+    }
+    if (next.kind !== "fpv") this.keys.clear();
+    this.handlers.onModeChange?.(next.kind);
+    this.handlers.onFollowChange?.(next.kind === "follow" ? next.droneId : null);
+    this.updateCapture();
+  }
+
+  /** Release a follow-chase session, returning to the preferred flight mode. */
+  private exitFollow(): void {
+    this.transition(releaseFollowState(this.mode, this.preferred));
+  }
+
+  setFlightMode(mode: "fpv" | "orbit"): void {
+    this.preferred = mode;
+    this.transition(flightModeState(mode));
+  }
+
   setSelection(id: string | null): void {
     if (id === this.selectedId) return;
     this.selectedId = id;
     for (const rig of this.rigs.values()) this.refreshRings(rig);
     if (this.mode.kind === "follow" && this.mode.droneId !== id) {
-      this.mode = { kind: "orbit" };
-      this.handlers.onFollowChange?.(null);
+      this.exitFollow();
     }
   }
 
   requestFollow(droneId: string | null): void {
-    this.mode = droneId ? { kind: "follow", droneId } : { kind: "orbit" };
     this.lastInteraction = performance.now();
     this.controls.autoRotate = false;
-    this.handlers.onFollowChange?.(droneId);
+    this.transition(followState(this.mode, this.preferred, droneId));
   }
 
   isFollowing(): boolean {
     return this.mode.kind === "follow";
   }
 
-  getCameraInfo(): { mode: "orbit" | "follow"; droneId: string | null } {
-    return this.mode.kind === "follow" ? { mode: "follow", droneId: this.mode.droneId } : { mode: "orbit", droneId: null };
+  getCameraInfo(): { mode: "fpv" | "orbit" | "follow"; droneId: string | null } {
+    return this.mode.kind === "follow"
+      ? { mode: "follow", droneId: this.mode.droneId }
+      : { mode: this.mode.kind, droneId: null };
+  }
+
+  /** Latest FPV telemetry (for the wrapper's minimap / HUD restores). */
+  lastTelemetry(): FpvTelemetry | null {
+    return this.lastTelemetryValue;
+  }
+
+  /** Pointer lock on the canvas (must be called from a user gesture). */
+  requestPointerLock(): void {
+    if (!this.fpvLockSupported || this.locked) return;
+    const el = this.renderer.domElement;
+    try {
+      const res = el.requestPointerLock() as unknown as Promise<void> | undefined;
+      if (res && typeof res.catch === "function") res.catch(() => this.onPointerLockError());
+    } catch {
+      this.onPointerLockError();
+    }
+  }
+
+  exitPointerLock(): void {
+    if (this.locked && document.exitPointerLock) document.exitPointerLock();
+  }
+
+  private updateCapture(): void {
+    this.handlers.onCaptureChange?.(fpvCaptureActive(this.mode.kind, this.locked));
   }
 
   dispose(): void {
@@ -270,6 +427,17 @@ export class World3D {
     el.removeEventListener("dblclick", this.onDblClick);
     el.removeEventListener("webglcontextlost", this.onContextLost);
     this.controls.removeEventListener("start", this.onControlsStart);
+    window.removeEventListener("keydown", this.onKeyDown);
+    window.removeEventListener("keyup", this.onKeyUp);
+    window.removeEventListener("blur", this.onFocusLost);
+    document.removeEventListener("visibilitychange", this.onFocusLost);
+    document.removeEventListener("mousemove", this.onMouseMove);
+    document.removeEventListener("pointerlockchange", this.onPointerLockChange);
+    document.removeEventListener("pointerlockerror", this.onPointerLockError);
+    if (this.locked) this.exitPointerLock();
+    this.keys.clear();
+    this.handlers.onLockChange?.(false);
+    this.handlers.onCaptureChange?.(false);
     this.controls.dispose();
     // Maps included: label textures are cached (idempotent double-dispose) and
     // the grid/weather textures are per-instance, so disposing everything is safe.
@@ -864,8 +1032,14 @@ export class World3D {
 
   // ------------------------------------------------------------- input
 
+  private static readonly FPV_KEYS = new Set(["w", "a", "s", "d", "x", " ", "shift"]);
+
   private onPointerDown = (e: PointerEvent): void => {
     if (e.button !== 0) return;
+    if (this.mode.kind === "fpv" && !this.locked && this.fpvLockSupported) {
+      this.requestPointerLock();
+      this.suppressSelect = true; // the lock-acquiring click must not select
+    }
     this.pointerDown = { x: e.clientX, y: e.clientY };
   };
 
@@ -874,6 +1048,10 @@ export class World3D {
     const dx = e.clientX - this.pointerDown.x;
     const dy = e.clientY - this.pointerDown.y;
     this.pointerDown = null;
+    if (this.suppressSelect) {
+      this.suppressSelect = false;
+      return;
+    }
     if (classifyGesture(Math.hypot(dx, dy)) !== "click") return;
     const hit = this.pickAt(e.clientX, e.clientY);
     this.handlers.onSelect(hit ? (hit.userData.droneId as string) : null);
@@ -890,13 +1068,54 @@ export class World3D {
     }
   };
 
+  private onKeyDown = (e: KeyboardEvent): void => {
+    if (!fpvCaptureActive(this.mode.kind, this.locked)) return;
+    const k = e.key.toLowerCase();
+    if (World3D.FPV_KEYS.has(k)) {
+      e.preventDefault();
+      this.keys.add(k);
+    }
+  };
+
+  private onKeyUp = (e: KeyboardEvent): void => {
+    this.keys.delete(e.key.toLowerCase());
+  };
+
+  private onFocusLost = (): void => {
+    this.keys.clear();
+    this.fpv.vel.set(0, 0, 0);
+    this.pointerDown = null;
+    this.suppressSelect = false;
+  };
+
+  private onMouseMove = (e: MouseEvent): void => {
+    if (!fpvCaptureActive(this.mode.kind, this.locked)) return;
+    this.fpv.yaw = wrapYaw(this.fpv.yaw + e.movementX * FPV_SENSITIVITY);
+    this.fpv.pitch = clampPitch(this.fpv.pitch - e.movementY * FPV_SENSITIVITY);
+  };
+
+  private onPointerLockChange = (): void => {
+    const was = this.locked;
+    this.locked = document.pointerLockElement === this.renderer.domElement;
+    if (this.locked !== was) {
+      if (!this.locked) this.onFocusLost();
+      this.handlers.onLockChange?.(this.locked);
+      this.updateCapture();
+    }
+  };
+
+  private onPointerLockError = (): void => {
+    if (!this.locked) return;
+    this.locked = false;
+    this.onFocusLost();
+    this.handlers.onLockChange?.(false);
+    this.updateCapture();
+  };
+
   private onControlsStart = (): void => {
     this.lastInteraction = performance.now();
     this.controls.autoRotate = false;
-    if (this.mode.kind === "follow") {
-      this.mode = { kind: "orbit" };
-      this.handlers.onFollowChange?.(null);
-    }
+    if (this.mode.kind === "follow") this.exitFollow();
   };
 
   private onContextLost = (e: Event): void => {
@@ -922,10 +1141,9 @@ export class World3D {
 
   private updateCamera(now: number, dtMs: number, alpha: number): void {
     if (this.mode.kind === "follow") {
-      const rig = this.rigs.get(this.mode.droneId);
+      const rig = this.mode.kind === "follow" ? this.rigs.get(this.mode.droneId ?? "") : null;
       if (!rig) {
-        this.mode = { kind: "orbit" };
-        this.handlers.onFollowChange?.(null);
+        this.exitFollow();
         return;
       }
       const d = rig.lastDrone;
@@ -950,8 +1168,69 @@ export class World3D {
         damp(this.controls.target.y, target.y, 4, dtMs),
         damp(this.controls.target.z, target.z, 4, dtMs)
       );
-    } else if (!this.reduced && now - this.lastInteraction > IDLE_DRIFT_MS) {
+    } else if (this.mode.kind === "orbit" && !this.reduced && now - this.lastInteraction > IDLE_DRIFT_MS) {
       this.controls.autoRotate = true;
+    }
+  }
+
+  private vec3ToPlain(v: THREE.Vector3): Vec3 {
+    return { x: v.x, y: v.y, z: v.z };
+  }
+
+  private updateFpv(dtMs: number): void {
+    const captured = fpvCaptureActive(this.mode.kind, this.locked);
+    if (captured) {
+      const zMax = this.frame?.current.sector.zMax ?? 150;
+      const input = {
+        fwd: (this.keys.has("w") ? 1 : 0) - (this.keys.has("s") ? 1 : 0),
+        strafe: (this.keys.has("d") ? 1 : 0) - (this.keys.has("a") ? 1 : 0),
+        up: (this.keys.has(" ") ? 1 : 0) - (this.keys.has("x") ? 1 : 0),
+        boost: this.keys.has("shift") ? FPV_BOOST : 1,
+      };
+      const res = fpvStep(
+        { pos: this.vec3ToPlain(this.fpv.pos), vel: this.vec3ToPlain(this.fpv.vel) },
+        input,
+        this.fpv.yaw,
+        this.fpv.pitch,
+        dtMs,
+        this.sectorW,
+        this.sectorH,
+        zMax
+      );
+      this.fpv.pos.set(res.pos.x, res.pos.y, res.pos.z);
+      this.fpv.vel.set(res.vel.x, res.vel.y, res.vel.z);
+    }
+    this.camera.position.copy(this.fpv.pos);
+    this.camera.rotation.order = "YXZ";
+    this.camera.rotation.y = this.fpv.yaw;
+    this.camera.rotation.x = this.fpv.pitch;
+
+    // HUD telemetry (sector-frame position).
+    if (this.handlers.onFpvTelemetry) {
+      let inWeather = false;
+      let weatherDepth = 0;
+      for (const wz of this.frame?.current.weather ?? []) {
+        const cx = wz.center.x - this.sectorW / 2;
+        const cz = wz.center.z - this.sectorH / 2;
+        const dist = Math.hypot(this.fpv.pos.x - cx, this.fpv.pos.y - wz.center.y, this.fpv.pos.z - cz);
+        if (dist < wz.radius) {
+          inWeather = true;
+          weatherDepth = Math.max(weatherDepth, 1 - dist / wz.radius);
+        }
+      }
+      const headingDeg = ((wrapYaw(this.fpv.yaw) * 180) / Math.PI + 360) % 360;
+      this.lastTelemetryValue = {
+        x: this.fpv.pos.x + this.sectorW / 2,
+        y: this.fpv.pos.z + this.sectorH / 2,
+        z: this.fpv.pos.y,
+        headingDeg,
+        pitchDeg: (this.fpv.pitch * 180) / Math.PI,
+        speedMps: this.fpv.vel.length(),
+        inWeather,
+        weatherDepth,
+        locked: this.locked,
+      };
+      this.handlers.onFpvTelemetry(this.lastTelemetryValue);
     }
   }
 
@@ -965,7 +1244,11 @@ export class World3D {
     const paused = frame?.current.paused ?? true;
     const alpha = interpAlpha(frame, now, paused, this.reduced);
 
-    this.updateCamera(now, dtMs, alpha);
+    if (this.mode.kind === "fpv") {
+      this.updateFpv(dtMs);
+    } else {
+      this.updateCamera(now, dtMs, alpha);
+    }
 
     for (const rig of this.rigs.values()) {
       const d = rig.lastDrone;
@@ -1000,7 +1283,10 @@ export class World3D {
       this.handlers.onCompass((Math.atan2(dx, -dy) * 180) / Math.PI);
     }
 
-    this.controls.update();
+    // OrbitControls.update() calls camera.lookAt() unconditionally (it does
+    // not check `enabled`), so it must never run while FPV owns the camera.
+    if (this.mode.kind !== "fpv") this.controls.update();
+
     this.renderer.render(this.scene, this.camera);
     this.raf = requestAnimationFrame(this.tick);
   };

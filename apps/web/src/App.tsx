@@ -1,4 +1,4 @@
-import { Suspense, lazy, useEffect, useMemo, useState } from "react";
+import { Suspense, lazy, useEffect, useMemo, useRef, useState } from "react";
 import type { AirspaceQueryResult, DroneView } from "@utm/core";
 import Ops2D from "./components/Ops2D.js";
 import { fmtSimTime, postCommand, useSimulation } from "./useSimulation.js";
@@ -18,6 +18,10 @@ export default function App() {
   const [notice, setNotice] = useState<string | null>(null);
   const [queryResult, setQueryResult] = useState<AirspaceQueryResult | null>(null);
   const [queryBusy, setQueryBusy] = useState(false);
+  // While FPV captures the mouse (pointer lock + fpv mode), the sim hotkeys
+  // (Space/W/D/V/R) must yield to flight controls. Live ref, written by the
+  // 3D view via onCaptureChange, read by the key handler below.
+  const fpvCaptureRef = useRef(false);
 
   // Persist the chosen view across reloads.
   useEffect(() => {
@@ -29,7 +33,7 @@ export default function App() {
     const onKey = (e: KeyboardEvent) => {
       const tag = (e.target as HTMLElement)?.tagName;
       if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return;
-      if (view === "3d" && e.key === "Escape") return; // the 3D view owns Escape
+      if (view === "3d" && (e.key === "Escape" || fpvCaptureRef.current)) return; // the 3D view owns these keys
       switch (e.key) {
         case " ":
           e.preventDefault();
@@ -160,6 +164,9 @@ export default function App() {
                 fullscreen={fullscreen}
                 onFullscreenChange={setFullscreen}
                 onSwitch2D={() => setView("2d")}
+                onCaptureChange={(captured) => {
+                  fpvCaptureRef.current = captured;
+                }}
               />
             </Suspense>
           )}

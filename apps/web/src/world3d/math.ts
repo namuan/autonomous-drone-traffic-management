@@ -122,6 +122,191 @@ export function droneScenePos(d: DroneView, prev: DroneView | null, alpha: numbe
 /** Sim heading (deg, 0 = +x sector axis) -> scene yaw for a nose pointing +X. */
 export const headingYawRad = (headingDeg: number): number => (-headingDeg * Math.PI) / 180;
 
+// ---------------------------------------------------------------------------
+// FPV (first-person) spectator flight — pure movement math
+//
+// Conventions: yaw 0 = +Z (north), positive yaw turns toward +X (east);
+// pitch positive = up. Forward = (sin y, cos y * sin p, cos y * cos p).
+// ---------------------------------------------------------------------------
+
+export const FPV_BASE_SPEED = 55; // m/s
+/** Extra speed multiplier while holding Shift. */
+export const FPV_BOOST = 2.2;
+/** Velocity smoothing lambda (higher = snappier). */
+export const FPV_LAMBDA = 4;
+/** Max |pitch| in radians. */
+export const FPV_PITCH_LIMIT = 1.35;
+/** Pointer-look sensitivity (radians per pixel). */
+export const FPV_SENSITIVITY = 0.0022;
+/** Distance kept from the sector footprint edge. */
+export const FPV_CLAMP_MARGIN = 8;
+/** Max altitude above the sector ceiling. */
+export const FPV_CLAMP_ALT = 120;
+
+export interface Vec3 {
+  x: number;
+  y: number;
+  z: number;
+}
+
+/** Normalized look direction from yaw/pitch. */
+export function fpvDirection(yawRad: number, pitchRad: number): Vec3 {
+  const cp = Math.cos(pitchRad);
+  return { x: Math.sin(yawRad) * cp, y: Math.sin(pitchRad), z: Math.cos(yawRad) * cp };
+}
+
+/** Horizontal right vector for strafing. */
+export function fpvRight(yawRad: number): Vec3 {
+  return { x: Math.cos(yawRad), y: 0, z: -Math.sin(yawRad) };
+}
+
+export const wrapYaw = (yawRad: number): number => {
+  const twoPi = Math.PI * 2;
+  return (((yawRad + Math.PI) % twoPi) + twoPi) % twoPi - Math.PI;
+};
+
+export const clampPitch = (pitchRad: number): number =>
+  Math.max(-FPV_PITCH_LIMIT, Math.min(FPV_PITCH_LIMIT, pitchRad));
+
+export interface FpvInput {
+  /** -1..1 (S..W). */
+  fwd: number;
+  /** -1..1 (A..D). */
+  strafe: number;
+  /** -1..1 (X..Space). */
+  up: number;
+  /** 1 = normal, >1 = boosted. */
+  boost: number;
+}
+
+export interface FpvPose {
+  pos: Vec3;
+  vel: Vec3;
+}
+
+/**
+ * One FPV integration step. Input intent is normalized so diagonals do not
+ * move faster than straight lines; velocity is exponentially damped toward
+ * the target; the position is clamped to the sector and clamped velocity
+ * components are zeroed. Returns a new pose.
+ */
+export function fpvStep(
+  pose: FpvPose,
+  input: FpvInput,
+  yawRad: number,
+  pitchRad: number,
+  dtMs: number,
+  sectorWidthM: number,
+  sectorHeightM: number,
+  zMax: number,
+  opts: { baseSpeed?: number; boost?: number; lambda?: number } = {}
+): FpvPose {
+  const baseSpeed = opts.baseSpeed ?? FPV_BASE_SPEED;
+  const boost = opts.boost ?? FPV_BOOST;
+  const lambda = opts.lambda ?? FPV_LAMBDA;
+  const dtSec = Math.min(0.25, Math.max(0, dtMs) / 1000); // cap long frames
+
+  const fwd = fpvDirection(yawRad, pitchRad);
+  const right = fpvRight(yawRad);
+  let ix = fwd.x * input.fwd + right.x * input.strafe;
+  let iy = fwd.y * input.fwd + input.up;
+  let iz = fwd.z * input.fwd + right.z * input.strafe;
+  const ilen = Math.hypot(ix, iy, iz);
+  if (ilen > 0) {
+    ix /= ilen;
+    iy /= ilen;
+    iz /= ilen;
+  }
+
+  const speed = baseSpeed * (input.boost > 1 ? boost : 1);
+  const alpha = 1 - Math.exp(-lambda * dtSec);
+  const vel = {
+    x: pose.vel.x + (ix * speed - pose.vel.x) * alpha,
+    y: pose.vel.y + (iy * speed - pose.vel.y) * alpha,
+    z: pose.vel.z + (iz * speed - pose.vel.z) * alpha,
+  };
+
+  let pos = {
+    x: pose.pos.x + vel.x * dtSec,
+    y: pose.pos.y + vel.y * dtSec,
+    z: pose.pos.z + vel.z * dtSec,
+  };
+
+  // Clamp to the sector footprint (with margin) and above/below the
+  // airspace envelope; zero the velocity component on a clamped axis.
+  const minX = -sectorWidthM / 2 + FPV_CLAMP_MARGIN;
+  const maxX = sectorWidthM / 2 - FPV_CLAMP_MARGIN;
+  const minZ = -sectorHeightM / 2 + FPV_CLAMP_MARGIN;
+  const maxZ = sectorHeightM / 2 - FPV_CLAMP_MARGIN;
+  const minY = 1.5;
+  const maxY = zMax + FPV_CLAMP_ALT;
+  const clampAxis = (v: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, v));
+  const px = clampAxis(pos.x, minX, maxX);
+  if (px !== pos.x) vel.x = 0;
+  const py = clampAxis(pos.y, minY, maxY);
+  if (py !== pos.y) vel.y = 0;
+  const pz = clampAxis(pos.z, minZ, maxZ);
+  if (pz !== pos.z) vel.z = 0;
+  pos = { x: px, y: py, z: pz };
+
+  return { pos, vel };
+}
+
+/** FPV keys only act while the camera is captured (pointer-locked). */
+export function fpvCaptureActive(mode: "fpv" | "orbit" | "follow", locked: boolean): boolean {
+  return mode === "fpv" && locked;
+}
+
+// ---------------------------------------------------------------------------
+// Camera-mode state machine (pure — World3D applies side effects around it)
+// ---------------------------------------------------------------------------
+
+export type CamModeKind = "fpv" | "orbit" | "follow";
+
+export interface CamModeState {
+  kind: CamModeKind;
+  /** Follow target, when kind === "follow". */
+  droneId: string | null;
+}
+
+/** User picked a flight mode (never "follow"). */
+export function flightModeState(mode: "fpv" | "orbit"): CamModeState {
+  return { kind: mode, droneId: null };
+}
+
+/** Engage or release a follow-chase session; release returns to `preferred`. */
+export function followState(current: CamModeState, preferred: "fpv" | "orbit", droneId: string | null): CamModeState {
+  if (!droneId) return { kind: preferred, droneId: null };
+  if (current.kind === "follow" && current.droneId === droneId) return current;
+  return { kind: "follow", droneId };
+}
+
+/** Single release path for every follow-exit trigger. */
+export function releaseFollowState(current: CamModeState, preferred: "fpv" | "orbit"): CamModeState {
+  if (current.kind !== "follow") return current;
+  return { kind: preferred, droneId: null };
+}
+
+/** Per-frame FPV HUD telemetry (sector-frame x/y, altitude z). */
+export interface FpvTelemetry {
+  x: number;
+  y: number;
+  z: number;
+  headingDeg: number;
+  pitchDeg: number;
+  speedMps: number;
+  /** Inside a weather cell? */
+  inWeather: boolean;
+  /** 0..1 depth inside the cell (drives the HUD tint). */
+  weatherDepth: number;
+  locked: boolean;
+}
+
+/** Compass/marker rotation: minimap north (+Z, sector +y) is screen-down; a
+ * positive heading turns the marker toward the screen-right (east). */
+export const cameraMarkerRotation = (headingDeg: number): number =>
+  wrapYaw(((180 - headingDeg) * Math.PI) / 180);
+
 /** Click-vs-drag disambiguation: pointer movement above the threshold is a camera gesture. */
 export const DRAG_THRESHOLD_PX = 5;
 export const classifyGesture = (movementPx: number): "click" | "drag" =>
